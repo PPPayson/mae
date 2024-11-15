@@ -15,25 +15,21 @@ import numpy as np
 import os
 import time
 from pathlib import Path
-
+import wandb
 import torch
+import timm
 import torch.backends.cudnn as cudnn
-from torch.utils.tensorboard import SummaryWriter
+from src.util.misc import WandBLogger
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
-
-import timm
-
-assert timm.__version__ == "0.3.2"  # version check
 import timm.optim.optim_factory as optim_factory
+import src.util.misc as misc
+from src.util.misc import NativeScalerWithGradNormCount as NativeScaler
+from src.models import models_mae
+from src.engine_pretrain import train_one_epoch
+from src.engine_eval import eval_alignment, eval_co3d, eval_one_epoch
 
-import util.misc as misc
-from util.misc import NativeScalerWithGradNormCount as NativeScaler
-
-import models_mae
-
-from engine_pretrain import train_one_epoch
-
+from src.data.datasets import build_co3d_eval_loader
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
@@ -72,6 +68,9 @@ def get_args_parser():
                         help='epochs to warmup LR')
 
     # Dataset parameters
+    parser.add_argument('--data_root', required=True, type=str, help='dataset root directory')
+    parser.add_argument('--data_list', required=True, type=str, help='dataset root directory')
+
     parser.add_argument('--data_path', default='/datasets01/imagenet_full_size/061417/', type=str,
                         help='dataset path')
 
@@ -101,6 +100,13 @@ def get_args_parser():
     parser.add_argument('--dist_url', default='env://',
                         help='url used to set up distributed training')
 
+    parser.add_argument('--clickmaps_path', default='./assets/co3d_val_processed.npz', type=str)
+    parser.add_argument('--alignments_json', default='./assets/alignments.json', type=str)
+    parser.add_argument('--clickmaps_human_path', default='./assets/human_ceiling_split_half_co3d_val.npz', type=str)
+    parser.add_argument('--imgnet_clickmaps_path', default='./assets/jay_imagenet_for_co3d_val_0.1_processed.npz', type=str)
+    parser.add_argument('--imgnet_clickmaps_human_path', default='./assets/human_ceiling_split_half_jay_imagenet_for_co3d_val_0.1.npz', type=str)
+    parser.add_argument('--imgnet2co3d_label', default='./assets/synset_to_co3d.npy', type=str)
+
     return parser
 
 
@@ -128,6 +134,18 @@ def main(args):
     dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
     print(dataset_train)
 
+    transform_val = transforms.Compose([
+        transforms.CenterCrop(args.input_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    args.mean = [0.485, 0.456, 0.406]
+    args.std = [0.229, 0.224, 0.225]
+    dataset_val = datasets.ImageFolder(os.path.join(args.data_path, 'validation'), transform=transform_val)
+    
+    co3d_train_dataloader, co3d_val_dataloader, _, _ = build_co3d_eval_loader(args, transform_val, True)
+    co3d_test_dataloader, imgnet_test_dataloader = build_co3d_eval_loader(args, transform_val, False)    
+
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()
         global_rank = misc.get_rank()
@@ -135,15 +153,21 @@ def main(args):
             dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
         )
         print("Sampler_train = %s" % str(sampler_train))
+        sampler_val = torch.utils.data.DistributedSampler(
+            dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False
+        )
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
+        sampler_val = torch.utils.data.RandomSampler(dataset_val)
+
 
     if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.log_dir)
+        wandb.login(key="50923956f844f2494110e5b6c020d31fa1072149")
+        log_writer = WandBLogger(log_dir=args.log_dir, args=args)
+        #log_writer = SummaryWriter(log_dir=args.log_dir)
     else:
         log_writer = None
-
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
         batch_size=args.batch_size,
@@ -151,7 +175,13 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=True,
     )
-    
+    data_loader_val = torch.utils.data.DataLoader(
+        dataset_val, sampler=sampler_val,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=False
+    )
     # define the model
     model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
 
@@ -170,13 +200,13 @@ def main(args):
 
     print("accumulate grad iterations: %d" % args.accum_iter)
     print("effective batch size: %d" % eff_batch_size)
-
+    model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-        model_without_ddp = model.module
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=False)
+        # model_without_ddp = model.module
     
     # following timm: set wd as 0 for bias and norm layers
-    param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
+    param_groups = optim_factory.param_groups_weight_decay(model_without_ddp, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     print(optimizer)
     loss_scaler = NativeScaler()
@@ -185,6 +215,7 @@ def main(args):
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
@@ -194,6 +225,18 @@ def main(args):
             log_writer=log_writer,
             args=args
         )
+        eval_one_epoch(
+            model, data_loader_val,
+            device, epoch,
+            log_writer=log_writer,
+             args=args)
+             
+        eval_co3d(model_without_ddp, co3d_train_dataloader,
+                    co3d_val_dataloader, co3d_test_dataloader, 
+                    imgnet_test_dataloader, device, epoch, num_epochs=50, 
+                    batch_size=args.batch_size, learning_rate=5e-4, log_writer=log_writer,
+                    num_workers=args.num_workers, args=args, eval_align=True)
+
         if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
