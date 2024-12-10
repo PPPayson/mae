@@ -10,7 +10,6 @@
 # --------------------------------------------------------
 import argparse
 import datetime
-import json
 import numpy as np
 import os
 import time
@@ -19,7 +18,6 @@ import wandb
 import torch
 import timm
 import random
-import torch.backends.cudnn as cudnn
 from src.util.misc import WandBLogger
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
@@ -397,18 +395,6 @@ def main(args):
                 misc.save_model(
                     args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                     loss_scaler=loss_scaler, epoch=epoch, linear_model_without_ddp=linear_model_without_ddp, linear_optimizer=linear_optimizer)
-
-        # log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-        #              'epoch': epoch, 'n_parameters': n_parameters}
-
-        # if args.output_dir and misc.is_main_process():
-        #     if log_writer is not None:
-        #         log_writer.flush()
-        #         log_name = f"{log_writer.writer.name}_log.txt"
-        #     else:
-        #         log_name = "log.txt"
-        #     with open(os.path.join(args.output_dir, log_name), mode="a", encoding="utf-8") as f:
-        #         f.write(json.dumps(log_stats) + "\n")
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
