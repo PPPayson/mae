@@ -119,13 +119,9 @@ class GroupMultiScaleCrop(object):
 
     def __call__(self, img_tuple):
         img_group, label = img_tuple
-        # import pdb; pdb.set_trace()
         im_size = img_group[0].size()[1:]
 
         crop_w, crop_h, offset_w, offset_h = self._sample_crop_size(im_size)
-        # crop_w, crop_h, offset_w, offset_h = 224, 224, 0, 0
-        # crop_img_group = [img.crop((offset_w, offset_h, offset_w + crop_w, offset_h + crop_h)) for img in img_group]
-        # ret_img_group = [img.resize((self.input_size[0], self.input_size[1]), self.interpolation) for img in crop_img_group]
         
         crop_img_group = [torchvision.transforms.functional.crop(img, offset_w, offset_h, crop_w, crop_h) for img in img_group]
         ret_img_group = [torchvision.transforms.functional.resize(img, (self.input_size[0], self.input_size[1]), self.interpolation) for img in crop_img_group]

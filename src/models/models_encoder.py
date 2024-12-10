@@ -8,7 +8,7 @@ from timm.models.vision_transformer import PatchEmbed, Block
 from src.util.pos_embed import get_2d_sincos_pos_embed
 import timm
 
-class EncoderTIMM(nn.Module):
+class EncoderViT(nn.Module):
     def __init__(self, model_name='vit_small_patch16_224.augreg_in21k_ft_in1k', pretrained=True, drop_rate=0, drop_path_rate=0, **kwargs):
         super().__init__()
         self.model = timm.create_model(
@@ -28,7 +28,6 @@ class EncoderTIMM(nn.Module):
         if len(x.shape) == 5:
             B, C, T, H, W = x.shape
             x = x.movedim(1, 2).reshape(B*T, C, H, W) # 2d encoder process frames separately   
-        #x = self.model.forward_features(x)
         x = self.patch_embed(x)
         x = self.model._pos_embed(x)
         x = self.model.patch_drop(x)
@@ -46,8 +45,6 @@ class EncoderTIMM(nn.Module):
         # apply Transformer blocks
         x = self.model.blocks(x)
         x = self.model.norm(x)
-
-
         return x
 
     def forward_2D(self, x, pool=False):
@@ -63,23 +60,8 @@ class EncoderTIMM(nn.Module):
             latent = self.forward_encoder(imgs, mask)
         return latent
 
-    def forward_grad(self, x):
-        x = self.model.patch_embed(x)
-        x = self.model._pos_embed(x)
-        x = self.model.patch_drop(x)
-        pre_blocks_x = self.model.norm_pre(x)
-        pre_blocks_x.retain_grad()
-        x = self.model.blocks(pre_blocks_x)
-        x = self.model.norm(x)
-        return x, pre_blocks_x
-
-
     def initialize_weights(self):
         # initialization
-        # initialize (and freeze) pos_embed by sin-cos embedding
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.patch_embed.num_patches**.5), cls_token=True)
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
         if not self.pretrained:
             # initialize patch_embed like nn.Linear (instead of nn.Conv2d)
             w = self.patch_embed.proj.weight.data
@@ -114,13 +96,13 @@ class LinearModel(torch.nn.Module):
         return x
 
 class FullModel(nn.Module):
-    def __init__(self, model, head, pool=False):
+    def __init__(self, encoder, head, pool=False):
         super(FullModel, self).__init__()
         self.head = head
-        self.model = model
+        self.encoder = encoder
         self.pool = pool
     def forward(self, x):
-        x, _, _ = self.model.forward_encoder(x, 0)
+        x = self.encoder(x, f2d=True, pool=self.pool)
         if len(x.shape) > 2:
             x = x.mean(dim=1)
         return self.head(x)

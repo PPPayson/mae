@@ -1,15 +1,15 @@
 import torch
-import utils
 import os
 from tqdm import tqdm
-from models_2D import LinearModel
-from data.co3d_dataset import EmbeddingDataset
+from src.models.models_encoder import LinearModel
+from src.data.co3d_dataset import EmbeddingDataset
 from torch.utils.data import DataLoader
 import torch.nn as nn
 from tqdm import tqdm
-from data.datasets import build_frames_dataset
+from src.data.datasets import build_frames_dataset
 from typing import Iterable
-
+import timm
+from torchvision import datasets, transforms
 
 def extract_features(model: torch.nn.Module, data_loader: Iterable, device: torch.device, pool: bool):
     model.eval()
@@ -20,7 +20,7 @@ def extract_features(model: torch.nn.Module, data_loader: Iterable, device: torc
         with torch.no_grad():
             images, labels = data
             images = images.to(device)
-            preds, _, _ = model.forward_encoder(images, 0)
+            preds = model(images, f2d=True, pool=pool)
             if len(preds.shape) > 2:
                 preds = torch.mean(preds, dim=1)
             features.append(preds.cpu())
@@ -30,7 +30,7 @@ def extract_features(model: torch.nn.Module, data_loader: Iterable, device: torc
     labels = torch.cat(labels_list).squeeze()
     return features, labels
 
-def save_features(encoder, dataset, args):
+def save_features(encoder, dataset, new_head, args):
     encoder.eval()
     #reverse_sequence = dataset.reverse_sequence
     dataset.reverse_sequence = False
@@ -38,7 +38,7 @@ def save_features(encoder, dataset, args):
         dataset, shuffle=False,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
+        pin_memory=False,
         drop_last=False,
         persistent_workers=True,
     )
@@ -52,25 +52,27 @@ def save_features(encoder, dataset, args):
             # videos = videos.movedim(1, 2).reshape(B*T, C, H, W)
             labels.append(label)
             fnames += fname
-            #activation = torch.mean(encoder(videos, f2d=True).detach().cpu(), dim=1)
-            #activation = encoder(videos, f2d=True).detach().cpu()
-            activation = encoder(videos).detach().cpu()
-            if len(activation.shape) > 2:
-                activation = torch.mean(activation, dim=1)
+            if new_head:
+                activation = encoder(videos, f2d=True, pool=args.timm_pool).detach().cpu()
+                if not args.timm_pool:
+                    activation = torch.mean(encoder, dim=1)
+            else:
+                activation = encoder(videos).detach().cpu()
             encoder_activations.append(activation)
     encoder_activations = torch.cat(encoder_activations)
     #dataset.reverse_sequence = reverse_sequence
     return encoder_activations, torch.cat(labels), fnames
 
-def get_features(encoder, dataset, train, args):
+def get_features(encoder, dataset, train, new_head, args):
     feature_path = args.features_path
     if train:
-        feature_name = args.model + '_train.pt'
+        feature_name = args.model + 'features_train.pt'
     else:
-        feature_name = args.model + '_val.pt'
+        feature_name = args.model + 'features_val.pt'
     if not os.path.isfile(os.path.join(feature_path, feature_name)):
-        encoder_activations = save_features(encoder, dataset, args)
-        torch.save(encoder_activations, os.path.join(feature_path, feature_name))
+        encoder_activations = save_features(encoder, dataset, new_head, args)
+        if new_head:
+            torch.save(encoder_activations, os.path.join(feature_path, feature_name))
     else:
         encoder_activations = torch.load(os.path.join(feature_path, feature_name))
     return encoder_activations
@@ -155,28 +157,47 @@ def get_logits(train_features, train_labels, train_fnames, val_features, val_lab
     train_labels = torch.cat(train_labels)
     val_logits = torch.cat(val_logits)
     val_labels = torch.cat(val_labels)
-    train_tuple = (train_logits, train_labels, train_fnames)
-    val_tuple = (val_logits, val_labels, val_fnames)
-    train_feature_name = args.model + '_' + args.dataset + '_logits_train.pt'
-    val_feature_name = args.model + '_' + args.dataset + '_logits_val.pt'
-    torch.save(train_tuple, os.path.join(args.features_path, train_feature_name))
-    torch.save(val_tuple, os.path.join(args.features_path, val_feature_name))
+
     return train_logits, train_labels, val_logits, val_labels
 
 def load_logits(encoder, args):
     feature_path = args.features_path
     if hasattr(encoder, "model_name"):
         model_name = encoder.model_name
+        model = timm.create_model(
+            model_name,
+            pretrained=True
+            ).to(args.device).eval()
+        new_head = False
+        data_config = timm.data.resolve_model_data_config(model)
+        transforms = timm.data.create_transform(**data_config, is_training=False)
     else:
         model_name = args.encoder_name
-    train_feature_name = model_name + '_' + args.dataset + '_logits_train.pt'
-    val_feature_name = model_name + '_' + args.dataset + '_logits_val.pt'
+        model = encoder.eval()
+        new_head = True
+        transform = transforms.Compose([
+            transforms.Resize(256, interpolation=3),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=args.mean, std=args.std)])
+    train_feature_name = args.model + '_' + args.dataset + '_logits_train.pt'
+    val_feature_name = args.model + '_' + args.dataset + '_logits_val.pt'
     if not (os.path.isfile(os.path.join(feature_path, train_feature_name)) and os.path.isfile(os.path.join(feature_path, val_feature_name))):
         train_dataset = build_frames_dataset(args)
         val_dataset = build_frames_dataset(args, is_train=False)
-        train_features, train_labels, train_fnames = get_features(encoder, train_dataset, True, args)
-        val_features, val_labels, val_fnames = get_features(encoder, val_dataset, False, args)
-        train_logits, train_labels, val_logits, val_labels = get_logits(train_features, train_labels, train_fnames, val_features, val_labels, val_fnames, args)
+        train_features, train_labels, train_fnames = get_features(model, train_dataset, True, new_head, args)
+        val_features, val_labels, val_fnames = get_features(model, val_dataset, False, new_head, args)
+        if new_head:
+            val_features, val_labels, val_fnames = get_features(model, val_dataset, False, new_head, args)
+            train_logits, train_labels, val_logits, val_labels = get_logits(train_features, train_labels, train_fnames, val_features, val_labels, val_fnames, args)
+        else:
+            train_logits, train_labels, val_logits, val_labels = train_features, train_labels, val_features, val_labels
+        train_tuple = (train_logits, train_labels, train_fnames)
+        val_tuple = (val_logits, val_labels, val_fnames)
+        train_feature_name = args.model + '_' + args.dataset + '_logits_train.pt'
+        val_feature_name = args.model + '_' + args.dataset + '_logits_val.pt'
+        torch.save(train_tuple, os.path.join(args.features_path, train_feature_name))
+        torch.save(val_tuple, os.path.join(args.features_path, val_feature_name))
     else:
         train_logits, train_labels, train_fnames = torch.load(os.path.join(feature_path, train_feature_name))
         val_logits, val_labels, val_fnames = torch.load(os.path.join(feature_path, val_feature_name))

@@ -71,7 +71,7 @@ class AutoregressiveMaskingGenereator:
     def __call__(self):
         masks = []
         for i in range(self.frames):
-            if i == 0:
+            if i < 2:
                 mask = np.zeros(self.num_patches)
             else:
                 mask = np.ones(self.num_patches)

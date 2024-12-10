@@ -20,8 +20,17 @@ import torch
 import torch.distributed as dist
 #from torch._six import inf
 import math
+import random
+import numpy as np
+from datetime import timedelta
 from torchvision.utils import make_grid
 import torchvision.transforms.functional as F
+import torchvision.transforms as transforms
+from torchvision.transforms import Compose, ToTensor
+from timm.utils import get_state_dict
+from scipy.spatial.transform import Rotation as R
+from timm.data.transforms import str_to_interp_mode
+
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
     with torch.no_grad():
@@ -67,7 +76,7 @@ class WandBLogger(object):
             if "frames" in k:
                 # import pdb; pdb.set_trace()
                 v = torch.cat(v)
-                img_grid = make_grid(v, nrow=1, normalize=not True, scale_each=not True)
+                img_grid = make_grid(v, nrow=8, normalize=not True, scale_each=not True)
                 img_grid = F.to_pil_image(img_grid.clip(0,0.996))
                 # img_grid = Image.fromarray((img_grid.movedim(0,2).cpu().numpy() * 255).astype(np.uint8))
                 img_grid = wandb.Image(img_grid, caption=f"input _ pred _ label")
@@ -117,7 +126,8 @@ class SmoothedValue(object):
             return
         t = torch.tensor([self.count, self.total], dtype=torch.float64, device='cuda')
         dist.barrier()
-        dist.all_reduce(t)
+        dist.all_reduce(t, dist.ReduceOp.AVG, async_op=False)
+        #dist.all_reduce(t)
         t = t.tolist()
         self.count = int(t[0])
         self.total = t[1]
@@ -166,7 +176,6 @@ class MetricLogger(object):
                 v = v.item()
             assert isinstance(v, (float, int))
             self.meters[k].update(v)
-
     def __getattr__(self, attr):
         if attr in self.meters:
             return self.meters[attr]
@@ -313,7 +322,7 @@ def init_distributed_mode(args):
     print('| distributed init (rank {}): {}, gpu {}'.format(
         args.rank, args.dist_url, args.gpu), flush=True)
     torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                                         world_size=args.world_size, rank=args.rank)
+                                         world_size=args.world_size, rank=args.rank, timeout=timedelta(minutes=30))
     torch.distributed.barrier()
     setup_for_distributed(args.rank == 0)
 
@@ -362,24 +371,24 @@ def get_grad_norm_(parameters, norm_type: float = 2.0) -> torch.Tensor:
     return total_norm
 
 
-def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
-    output_dir = Path(args.output_dir)
-    epoch_name = str(epoch)
-    if loss_scaler is not None:
-        checkpoint_paths = [output_dir / ('checkpoint-%s.pth' % epoch_name)]
-        for checkpoint_path in checkpoint_paths:
-            to_save = {
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'epoch': epoch,
-                'scaler': loss_scaler.state_dict(),
-                'args': args,
-            }
+# def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
+#     output_dir = Path(args.output_dir)
+#     epoch_name = str(epoch)
+#     if loss_scaler is not None:
+#         checkpoint_paths = [output_dir / ('checkpoint-%s.pth' % epoch_name)]
+#         for checkpoint_path in checkpoint_paths:
+#             to_save = {
+#                 'model': model_without_ddp.state_dict(),
+#                 'optimizer': optimizer.state_dict(),
+#                 'epoch': epoch,
+#                 'scaler': loss_scaler.state_dict(),
+#                 'args': args,
+#             }
 
-            save_on_master(to_save, checkpoint_path)
-    else:
-        client_state = {'epoch': epoch}
-        model.save_checkpoint(save_dir=args.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)
+#             save_on_master(to_save, checkpoint_path)
+#     else:
+#         client_state = {'epoch': epoch}
+#         model.save_checkpoint(save_dir=args.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)
 
 
 def load_model(args, model_without_ddp, optimizer, loss_scaler):
@@ -477,3 +486,105 @@ def get_cvm_attn_mask(q_len, num_frames):
     attn_mask = torch.tril(torch.ones((num_frames, num_frames))).to(torch.bool)
     attn_mask = attn_mask.repeat_interleave(q_len, dim=1, output_size=q_len*num_frames).repeat_interleave(q_len, dim=0, output_size=q_len*num_frames)
     return attn_mask
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, model_ema=None, linear_model_without_ddp=None, linear_optimizer=None):
+    output_dir = Path(args.output_dir)
+    epoch_name = str(epoch)
+    if linear_model_without_ddp is not None:
+        linear_weight = linear_model_without_ddp.state_dict()
+        linear_optimizer_state = linear_optimizer.state_dict()
+    else:
+        linear_weight = None
+        linear_optimizer_state = None
+    if loss_scaler != None:
+        checkpoint_paths = [output_dir / ('checkpoint-%s.pth' % epoch_name)]
+        for checkpoint_path in checkpoint_paths:
+            to_save = {
+                'model': model_without_ddp.state_dict(),
+                'linear_model': linear_weight,
+                'optimizer': optimizer.state_dict(),
+                'linear_optimizer': linear_optimizer_state,
+                'epoch': epoch,
+                'scaler': loss_scaler.state_dict(),
+                'args': args,
+            }
+
+            if model_ema != None:
+                to_save['model_ema'] = get_state_dict(model_ema)
+
+            save_on_master(to_save, checkpoint_path)
+    else:
+        client_state = {'epoch': epoch}
+        if model_ema != None:
+            client_state['model_ema'] = get_state_dict(model_ema)
+        model.save_checkpoint(save_dir=args.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)
+
+
+def auto_load_model(args, model, model_without_ddp, optimizer, loss_scaler, model_ema=None, linear_model_without_ddp=None, linear_optimizer=None):
+    output_dir = Path(args.output_dir)
+    if loss_scaler != None:
+        # torch.amp
+        if args.auto_resume and len(args.resume) == 0:
+            import glob
+            all_checkpoints = glob.glob(os.path.join(output_dir, 'checkpoint-*.pth'))
+            latest_ckpt = -1
+            for ckpt in all_checkpoints:
+                t = ckpt.split('-')[-1].split('.')[0]
+                if t.isdigit():
+                    latest_ckpt = max(int(t), latest_ckpt)
+            if latest_ckpt >= 0:
+                args.resume = os.path.join(output_dir, 'checkpoint-%d.pth' % latest_ckpt)
+            print("Auto resume checkpoint: %s" % args.resume)
+
+        if args.resume:
+            if args.resume.startswith('https'):
+                checkpoint = torch.hub.load_state_dict_from_url(
+                    args.resume, map_location='cpu', check_hash=True)
+            else:
+                checkpoint = torch.load(args.resume, map_location='cpu')
+            if linear_model_without_ddp is not None and 'linear_model' in checkpoint.keys():
+                linear_model_without_ddp.load_state_dict(checkpoint['linear_model'])
+            if linear_optimizer is not None and 'lienar_optimizer' in checkpoint.keys():
+                linear_optimizer.load_state_dict(checkpoint['linear_optimizer'])
+            model_without_ddp.load_state_dict(checkpoint['model'])
+            print("Resume checkpoint %s" % args.resume)
+            if 'optimizer' in checkpoint and 'epoch' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                args.start_epoch = checkpoint['epoch'] + 1
+                if hasattr(args, 'model_ema') and args.model_ema:
+                    _load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
+                if 'scaler' in checkpoint:
+                    loss_scaler.load_state_dict(checkpoint['scaler'])
+                print("With optim & sched!")
+    else:  
+        # deepspeed, only support '--auto_resume'.
+        if args.auto_resume:
+            import glob
+            all_checkpoints = glob.glob(os.path.join(output_dir, 'checkpoint-*'))
+            latest_ckpt = -1
+            for ckpt in all_checkpoints:
+                t = ckpt.split('-')[-1].split('.')[0]
+                if t.isdigit():
+                    latest_ckpt = max(int(t), latest_ckpt)
+            if latest_ckpt >= 0:
+                args.resume = os.path.join(output_dir, 'checkpoint-%d' % latest_ckpt)
+                print("Auto resume checkpoint: %d" % latest_ckpt)
+                _, client_states = model.load_checkpoint(args.output_dir, tag='checkpoint-%d' % latest_ckpt)
+                args.start_epoch = client_states['epoch'] + 1
+                if model_ema is not None:
+                    if args.model_ema:
+                        _load_checkpoint_for_ema(model_ema, client_states['model_ema'])
+
+def _load_checkpoint_for_ema(model_ema, checkpoint):
+    """
+    Workaround for ModelEma._load_checkpoint to accept an already-loaded object
+    """
+    mem_file = io.BytesIO()
+    torch.save(checkpoint, mem_file)
+    mem_file.seek(0)
+    model_ema._load_checkpoint(mem_file)

@@ -1,28 +1,139 @@
 import math
 import copy
+import timm
+import os
+import json
 import numpy as np
 from typing import Iterable
 import torch
 import torch.nn as nn
-import timm
-import os
-import json
-from einops import rearrange
-from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 import torch.nn.functional as F
-from models_2D import LinearModel, FullModel
 from torch.utils.data import DataLoader
-from tqdm import tqdm
-from data.co3d_dataset import EmbeddingDataset
-from data.datasets import build_co3d_eval_loader
-from scipy.stats import spearmanr
-from util.save_features import extract_features
 from torchvision.transforms import functional as tvF
 from matplotlib import pyplot as plt
-import submodules.clickme_processing.src.utils as clickme_utils
-import util.misc as misc
-import util.lr_sched as lr_sched
-import utils 
+from einops import rearrange
+from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+from src.models.models_encoder import LinearModel, FullModel
+from src.data.co3d_dataset import EmbeddingDataset
+from src.data.datasets import build_co3d_eval_loader
+from src.util.save_features import extract_features
+import src.util.clickme_utils as clickme_utils
+import src.util.misc as misc
+import src.util.metrics as metrics
+
+def autoreg_eval_one_epoch(model: torch.nn.Module,
+                        data_loader: Iterable, 
+                        device: torch.device, 
+                        epoch: int, 
+                        patch_size: int = 16,
+                        normalize_target: bool = True, 
+                        log_writer=None, 
+                        start_steps=None, 
+                        use_cce=True, 
+                        n_frames=4,
+                        camera_params_enabled=False, 
+                        categorical_camera=False, 
+                        alpha=(0.5, 0.5),
+                        linear_model=None,
+                        feature_loss=False, 
+                        args=None):
+    model.eval()
+    if linear_model is not None:
+        linear_model.eval()
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    header = 'EVAL epoch: [{}]'.format(epoch)
+    print_freq = 10
+    mean = torch.as_tensor(args.mean).to(device)[None, :, None, None, None]
+    std = torch.as_tensor(args.std).to(device)[None, :, None, None, None]
+    if use_cce:
+        loss_func = nn.CrossEntropyLoss()
+    else:
+        loss_func = nn.MSELoss()
+
+    for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        with torch.no_grad():
+            videos, bool_masked_pos = batch[0], batch[1]
+            true_camera_params = None
+            if camera_params_enabled:
+                true_camera_params = batch[2].to(device, non_blocking=True)
+                camera_param_cats = batch[3].to(device, non_blocking=True)
+                if feature_loss:
+                    features = batch[4].to(device, non_blocking=True)
+            elif feature_loss:
+                features = batch[2].to(device, non_blocking=True)
+            videos = videos.to(device, non_blocking=True)
+            bool_masked_pos = bool_masked_pos.to(device, non_blocking=True).flatten(1).to(torch.bool)
+            unnorm_videos = videos * std + mean  # in [0, 1]
+            videos_patch = rearrange(unnorm_videos, 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=1, p1=patch_size, p2=patch_size)
+            B, _, C = videos_patch.shape
+            labels = videos_patch[bool_masked_pos].reshape(B, -1, C)
+            with torch.cuda.amp.autocast(enabled=True):
+                outputs = model(videos, true_camera_params)
+                pred_frames = outputs['pred_frames']
+                if use_cce:
+                    labels_long = (labels*15).to(torch.long)
+                    pred_frames = rearrange(pred_frames, 'b (t n) (p c) -> b t c n p', c=16, t=n_frames-1)
+                    pred_frames = pred_frames[:, 1:, :, :, :]
+                    pred_frames = rearrange(pred_frames, 'b t c n p -> b c (t n) p', c=16, t=n_frames-2)
+                    loss = loss_func(input=pred_frames, target=labels_long)
+
+                else:
+                    pred_frames = rearrange(pred_frames, 'b (t n) p -> b t n p', t=n_frames-1)
+                    pred_frames = pred_frames[:, 1:, :, :]
+                    pred_frames = rearrange(pred_frames, 'b t n p -> b (t n) p', t=n_frames-2)                                
+                    loss = loss_func(input=pred_frames, target=labels)
+                if use_cce:
+                    loss = loss/math.log(16)
+                recon_loss_value = loss.item()
+                metric_logger.update(recon_loss=recon_loss_value)
+                if camera_params_enabled:
+                    pred_camera = outputs['pred_camera']
+                    gt_camera = outputs['gt_camera']
+                    if categorical_camera:
+                        camera_param_cats = camera_param_cats[:, 2:]
+                        pred_camera = rearrange(pred_camera, 'b t c -> b c t')[:, :, 1:]
+                        cam_loss = F.cross_entropy(input=pred_camera, target=camera_param_cats)/math.log(64)
+                    else:
+                        cam_loss = F.mse_loss(input=pred_camera, target=gt_embed)
+                    cam_loss_value = cam_loss.item()
+                    loss += alpha[0]*cam_loss
+                    metric_logger.update(cam_loss=cam_loss_value)
+                if feature_loss and linear_model is not None:
+                    new_features = linear_model(outputs['encoder_features'])
+                    features = rearrange(features[:, :n_frames-1, :], 'b t c -> (b t) c')
+                    features = F.softmax(features)
+                    f_loss = F.cross_entropy(new_features, features)/math.log(1000)
+                    f_loss_value = f_loss.item()
+                    loss += alpha[1]*f_loss
+                    metric_logger.update(feature_loss=f_loss_value)
+                loss_value = loss.item()
+                metric_logger.update(loss=loss_value)
+                metric_logger.synchronize_between_processes()
+    if log_writer is not None:
+        log_writer.set_step(start_steps)
+        log_writer.update(loss=metric_logger.loss.global_avg, head="val")
+        log_writer.update(epoch=epoch, head="val")
+        log_writer.update(recon_loss=metric_logger.recon_loss.global_avg, head="val")
+        if camera_params_enabled:
+            log_writer.update(cam_loss=metric_logger.cam_loss.global_avg, head='val')
+        if feature_loss and linear_model is not None:
+            log_writer.update(feature_loss=metric_logger.feature_loss.global_avg, head='val')
+        reconstruction = videos_patch.clone()
+        if use_cce:
+            pred_frames = torch.argmax(pred_frames, dim=1)/15.0
+        reconstruction[bool_masked_pos] = pred_frames.view(B*pred_frames.shape[1], -1).float()
+        reconstruction = rearrange(reconstruction, 'b n (p c) -> b n p c', c=3)
+        videos_patch = rearrange(unnorm_videos[0:1], 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=1, p1=patch_size, p2=patch_size)
+        videos_patch_to_mask = copy.deepcopy(videos_patch)
+        videos_patch_to_mask[bool_masked_pos[0:1]] = 0
+        masked_inp = rearrange(videos_patch_to_mask, 'b (t h w) (p0 p1 p2 c) -> b (t p0) c (h p1) (w p2)', p0=1, p1=patch_size, p2=patch_size, w=14, h=14, t=n_frames)
+        reconstruction = rearrange(reconstruction, 'b (t h w) (p0 p1 p2) c -> b (t p0) c (h p1) (w p2)', p0=1, p1=patch_size, p2=patch_size, w=14, h=14, t=n_frames)
+        if use_cce:
+            unnorm_videos = (unnorm_videos*15).to(torch.long)/15.
+        log_writer.update(valframes=[unnorm_videos[0].transpose(0, 1), reconstruction[0], masked_inp[0]], head="val")
+    print("Averaged stats:", metric_logger)
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
 
 def eval_one_epoch(model: torch.nn.Module,
                     data_loader: Iterable, device: torch.device, 
@@ -54,14 +165,144 @@ def eval_one_epoch(model: torch.nn.Module,
         log_writer.update(valframes=[reconstruction[0]], head="val")
         log_writer.update(commit=True, grad_norm=0, head="val")
 
-def eval_co3d(model: torch.nn.Module, train_data_loader: Iterable, val_data_loader: Iterable, test_data_loader: Iterable, imgnet_loader: Iterable, device: torch.device, epoch: int, num_epochs: int, 
-                batch_size: int, learning_rate=5e-4, log_writer=None, num_workers=16, args=None, eval_align=True):
-    train_features, train_labels = extract_features(model, train_data_loader, device, False)
-    val_features, val_labels = extract_features(model, val_data_loader, device, False)
+def eval_alignment(full_model:torch.nn.Module, test_data_loader: Iterable, 
+                device: torch.device, log_writer, visualize, args, return_acc=True, 
+                kernel_size=21, kernel_sigma=21):
+
+    full_model.eval()
+    sample_maps = []
+
+    criterion = nn.CrossEntropyLoss()
+    ceiling = test_data_loader.dataset.ceiling
+    alignment_scores = {'full_spearman':[], 'unnorm_spearman': []}
+    null_scores = {'full_spearman':[], }
+    all_test_acc = []
+
+    kernel = clickme_utils.circle_kernel(kernel_size, kernel_sigma).to(device)
+
+    # Evaluate each image
+    for i, batch in enumerate(test_data_loader):
+        imgs, hmps, labels, img_names, cat = batch
+        imgs, hmps, labels = imgs.to(device), hmps.to(device), labels.to(device)
+        img_name = img_names[0]
+        cat = cat[0]
+
+        # Select a random hmp for null score
+        sub_vec = np.where(np.array(test_data_loader.dataset.categories) != cat)[0]
+        random_idx = np.random.choice(sub_vec)
+        random_hmps = test_data_loader.dataset[random_idx]
+        random_hmps = torch.unsqueeze(torch.Tensor(random_hmps[1]), 0)
+
+        # Save a copy of the img for visualization
+        if len(visualize)>0 and i in visualize:
+            img = imgs.clone().detach().cpu().numpy().squeeze()
+            img = np.moveaxis(img, 0, -1)
+            img = img*args.std + args.mean
+            img = np.uint8(255*img)
+
+        # Get accuracy and loss
+        imgs.requires_grad = True
+        outputs = full_model(imgs)
+        test_acc = misc.accuracy(outputs, labels)[0].item()
+        all_test_acc.append(test_acc)
+        most_probable_class = torch.argmax(outputs, dim=-1)
+
+        most_probable_scores = outputs[torch.arange(outputs.size(0)), most_probable_class]  # Shape: (batch_size,)
+        saliency = torch.autograd.grad(outputs=most_probable_scores, inputs=imgs, 
+                                            grad_outputs=torch.ones_like(most_probable_scores),
+                                            create_graph=False)[0]
+                                            
+        saliency = torch.amax(saliency.abs(), dim=1).detach().cpu()
+
+        if saliency.shape[-1] != 224:
+            saliency = F.interpolate(saliency.unsqueeze(0), size=(224, 224), mode="bilinear").to(torch.float32)
+        # Get average hmps and average half hmps
+        hmps = tvF.resize(hmps, 256)
+        hmps = tvF.center_crop(hmps, (224, 224))
+        hmps = hmps.mean(1)
+        random_hmps = tvF.resize(random_hmps, 256)
+        random_hmps = tvF.center_crop(random_hmps, (224, 224))
+        random_hmps = random_hmps.mean(1)
+
+        hmps = (hmps - hmps.min()) / (hmps.max() - hmps.min())
+        random_hmps = (random_hmps - random_hmps.min()) / (random_hmps.max() - random_hmps.min())
+
+        # Get topk model saliency points and half top k to match sparisty of hmps and half hmps
+        full_saliency = saliency
+
+        full_saliency = clickme_utils.gaussian_blur(full_saliency.to(device).unsqueeze(0), kernel)
+        # Double convolve
+        full_saliency = clickme_utils.gaussian_blur(full_saliency, kernel).squeeze()
+
+        full_saliency = full_saliency.detach().cpu().numpy()
+        hmps = hmps.detach().cpu().numpy()
+        random_hmps = random_hmps.detach().cpu().numpy()
+
+        # Normalize
+        full_saliency = (full_saliency - full_saliency.min())/(full_saliency.max() - full_saliency.min())
+
+        # Compute spearman
+        full_spearman = clickme_utils.compute_spearman_correlation(full_saliency, hmps)
+        full_null_spearman = clickme_utils.compute_spearman_correlation(full_saliency, random_hmps)
+        alignment_scores['unnorm_spearman'].append(full_spearman)
+
+        full_spearman /= ceiling
+        full_null_spearman /= ceiling
+        alignment_scores['full_spearman'].append(full_spearman)
+        null_scores['full_spearman'].append(full_null_spearman)
+
+        # Save image for wandb log
+        if len(visualize)>0 and i in visualize:
+            hmps_img = hmps.squeeze()
+            f = plt.figure()
+            plt.subplot(1, 3, 1)
+            plt.imshow(full_saliency.squeeze())
+            plt.axis("off")
+            plt.subplot(1, 3, 2)
+            hmps_img = (hmps_img - np.min(hmps_img))/np.max(hmps_img)
+            plt.imshow(hmps_img)
+            plt.axis("off")
+            plt.subplot(1, 3, 3)
+            plt.imshow(img)
+            plt.axis("off")
+
+            f.tight_layout(pad=0)
+            f.canvas.draw()
+            buf = f.canvas.buffer_rgba()
+            ncols, nrows = f.canvas.get_width_height()
+            image = np.frombuffer(buf, dtype=np.uint8).reshape(nrows, ncols, 4)
+            image = torch.unsqueeze(torch.Tensor(image), 0)
+            image = image[:, int(math.floor(image.shape[1]/4)):int(image.shape[1] - math.floor(image.shape[1]/4)), :, :]
+            sample_maps.append(image)
+            plt.close()
+
+    avg_test_acc = sum(all_test_acc)/float(len(all_test_acc))
+    if log_writer is not None:
+        log_writer.update(heatmaps=sample_maps, head=f"{test_data_loader.dataset.dataset_name}_eval")
+    return avg_test_acc, alignment_scores, null_scores
+
+def eval_co3d(model: torch.nn.Module, 
+            train_data_loader: Iterable, 
+            val_data_loader: Iterable, 
+            test_data_loader: Iterable, 
+            imgnet_loader: Iterable, 
+            device: torch.device, 
+            epoch: int, 
+            num_epochs: int, 
+            batch_size: int, 
+            learning_rate=5e-4, 
+            log_writer=None, 
+            start_steps=None, 
+            num_workers=16, 
+            args=None, 
+            eval_align=True):
+
+    train_features, train_labels = extract_features(model.encoder, train_data_loader, device, pool=args.timm_pool)
+    val_features, val_labels = extract_features(model.encoder, val_data_loader, device, pool=args.timm_pool)
 
     metric_logger = misc.MetricLogger(delimiter="   ")
     header = f'Co3D EVAL'
-    print_freq = 10
+    print_freq = 1
     
     train_dataset = EmbeddingDataset(train_features, train_labels)
     val_dataset = EmbeddingDataset(val_features, val_labels)
@@ -72,6 +313,8 @@ def eval_co3d(model: torch.nn.Module, train_data_loader: Iterable, val_data_load
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(linear_model.parameters(), lr=learning_rate, weight_decay=1e-4)
     best_acc = 0
+    best_model_state = linear_model.state_dict().copy()
+
     for e in metric_logger.log_every(range(num_epochs), print_freq, header):
         metric_logger.update(epoch=e)
         linear_model.train()
@@ -105,8 +348,10 @@ def eval_co3d(model: torch.nn.Module, train_data_loader: Iterable, val_data_load
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
         avg_val_loss = val_loss / len(val_loader)
-        acc = 100 * correct/total
-        best_acc = max(acc, best_acc)
+        acc = correct/total
+        if acc > best_acc:
+            best_acc = acc
+            best_model_state = linear_model.state_dict().copy()
  
         metric_logger.update(train_loss=avg_train_loss)
         metric_logger.update(val_loss=avg_val_loss)
@@ -114,259 +359,23 @@ def eval_co3d(model: torch.nn.Module, train_data_loader: Iterable, val_data_load
         metric_logger.synchronize_between_processes()
 
     if log_writer is not None:
-            log_writer.set_step()        
             log_writer.update(val_acc=best_acc, head='co3d_eval')
             log_writer.update(epoch=epoch, head='co3d_eval')
 
-    #TODO Use model with best val acc for alignment and test
     if eval_align:
-        full_model = FullModel(model, linear_model, pool=False)
+        linear_model.load_state_dict(best_model_state)
+        full_model = FullModel(model.encoder, linear_model, pool=args.timm_pool)
         avg_test_acc, alignment_scores, null_scores = eval_alignment(full_model, test_data_loader, device, log_writer, list(range(10)), args)
         imgnet_acc, imgnet_align, imgnet_null = eval_alignment(full_model, imgnet_loader, device, log_writer, list(range(10)), args)
         
         if log_writer is not None:
             log_writer.update(test_acc=avg_test_acc, head='co3d_eval')
-            
-            log_writer.update(full_auc=np.mean(alignment_scores['full_auc']), head='co3d_eval')
-            log_writer.update(topk_auc=np.mean(alignment_scores['topk_auc']), head='co3d_eval')
-            log_writer.update(halfk_auc=np.mean(alignment_scores['halfk_auc']), head='co3d_eval')
-            log_writer.update(full_null_auc=np.mean(null_scores['full_auc']), head='co3d_eval_null')
-            log_writer.update(topk_null_auc=np.mean(null_scores['topk_auc']), head='co3d_eval_null')
-            log_writer.update(halfk_null_auc=np.mean(null_scores['halfk_auc']), head='co3d_eval_null')
             log_writer.update(full_spearman=np.mean(alignment_scores['full_spearman']), head='co3d_eval')
-            log_writer.update(topk_spearman=np.mean(alignment_scores['topk_spearman']), head='co3d_eval')
-            log_writer.update(halfk_spearman=np.mean(alignment_scores['halfk_spearman']), head='co3d_eval')
-            log_writer.update(full_null_spearman=np.mean(null_scores['full_spearman']), head='co3d_eval_null')
-            log_writer.update(topk_null_spearman=np.mean(null_scores['topk_spearman']), head='co3d_eval_null')
-            log_writer.update(halfk_null_spearman=np.mean(null_scores['halfk_spearman']), head='co3d_eval_null')
+            log_writer.update(full_null_spearman=np.mean(null_scores['full_spearman']), head='co3d_eval')
+            log_writer.update(unnorm_spearman=np.mean(alignment_scores['unnorm_spearman']), head='co3d_eval')
 
             log_writer.update(test_acc=imgnet_acc, head='imgnet_eval')
-            log_writer.update(full_auc=np.mean(imgnet_align['full_auc']), head='imgnet_eval')
-            log_writer.update(topk_auc=np.mean(imgnet_align['topk_auc']), head='imgnet_eval')
-            log_writer.update(halfk_auc=np.mean(imgnet_align['halfk_auc']), head='imgnet_eval')
-            log_writer.update(full_null_auc=np.mean(imgnet_null['full_auc']), head='imgnet_eval_null')
-            log_writer.update(topk_null_auc=np.mean(imgnet_null['topk_auc']), head='imgnet_eval_null')
-            log_writer.update(halfk_null_auc=np.mean(imgnet_null['halfk_auc']), head='imgnet_eval_null')
             log_writer.update(full_spearman=np.mean(imgnet_align['full_spearman']), head='imgnet_eval')
-            log_writer.update(topk_spearman=np.mean(imgnet_align['topk_spearman']), head='imgnet_eval')
-            log_writer.update(halfk_spearman=np.mean(imgnet_align['halfk_spearman']), head='imgnet_eval')
-            log_writer.update(full_null_spearman=np.mean(imgnet_null['full_spearman']), head='imgnet_eval_null')
-            log_writer.update(topk_null_spearman=np.mean(imgnet_null['topk_spearman']), head='imgnet_eval_null')
-            log_writer.update(halfk_null_spearman=np.mean(imgnet_null['halfk_spearman']), head='imgnet_eval_null')
-    return
-
-def eval_alignment(full_model:torch.nn.Module, test_data_loader: Iterable, 
-                device: torch.device, log_writer, visualize, args, return_acc=True, 
-                kernel_size=21, kernel_sigma=21):
-
-    #TODO Compute halfk score with half human maps
-    # Check if model maps have an offset
-    # Think of better way to do topk filter
-    full_model.eval()
-    sample_maps = []
-    with open(args.alignments_json, 'r') as f:
-        alignments = json.load(f)
-    # with open(args.stats_json, 'r') as f:
-    #     num_pos = json.load(f)
-    #     half_num_pos = num_pos['half_num_pos']
-    #     num_pos = num_pos['num_pos']
-    criterion = nn.CrossEntropyLoss()
-    #TODO Use model with best val acc for alignment and test
-    auc_ceiling = alignments[test_data_loader.dataset.dataset_name]
-    spearman_ceiling = test_data_loader.dataset.ceiling
-    alignment_scores = {'full_auc':[], 'topk_auc':[], 'halfk_auc': [], 'full_spearman':[], 'topk_spearman':[], 'halfk_spearman': []}
-    null_scores = {'full_auc':[], 'topk_auc':[], 'halfk_auc': [], 'full_spearman':[], 'topk_spearman':[], 'halfk_spearman': []}
-    all_test_acc = []
-
-
-    #kernel = utils.gaussian_kernel(size=21, sigma=math.sqrt(21)).to(device)
-    kernel = clickme_utils.circle_kernel(kernel_size, kernel_sigma).to(device)
-
-    # Evaluate each image
-    for i, batch in tqdm(enumerate(test_data_loader)):
-        imgs, hmps, labels, img_names, cat = batch
-        imgs, hmps, labels = imgs.to(device), hmps.to(device), labels.to(device)
-        img_name = img_names[0]
-        cat = cat[0]
-
-        # Select a random hmp for null score
-        sub_vec = np.where(np.array(test_data_loader.dataset.categories) != cat)[0]
-        random_idx = np.random.choice(sub_vec)
-        random_hmps = test_data_loader.dataset[random_idx]
-        random_hmps = torch.unsqueeze(torch.Tensor(random_hmps[1]), 0)
-
-        # Save a copy of the img for visualization
-        if len(visualize)>0 and i in visualize:
-            img = imgs.clone().detach().cpu().numpy().squeeze()
-            img = np.moveaxis(img, 0, -1)
-            img = img*args.std + args.mean
-            img = np.uint8(255*img)
-
-        # Get accuracy and loss
-        if return_acc:
-            outputs = full_model(imgs)
-            # loss = criterion(outputs, labels)
-
-            test_acc = utils.accuracy(outputs, labels)[0].item()
-            all_test_acc.append(test_acc)
-
-        # Get saliency map with smoothgrad
-        saliency = torch.Tensor(utils.batch_smooth_grad(full_model, imgs))
-        if saliency.shape[-1] != 224:
-            saliency = F.interpolate(saliency.unsqueeze(0), size=(224, 224), mode="bilinear").to(torch.float32)
-
-        # Get average hmps and average half hmps
-        if test_data_loader.dataset.dataset_name == "imgnet":
-            hmps = tvF.resize(hmps, 256)
-
-        hmps = tvF.center_crop(hmps, (224, 224))
-        hmps_indices = list(range(hmps.shape[1]))
-        random_index = np.random.choice(hmps_indices, int(len(hmps_indices)/2), replace=False)
-        half_hmps = hmps[:, random_index, :, :]
-        half_hmps = half_hmps.mean(1)
-        hmps = hmps.mean(1)
-        if test_data_loader.dataset.dataset_name == "imgnet":
-            random_hmps = tvF.resize(random_hmps, 256)
-
-        random_hmps = tvF.center_crop(random_hmps, (224, 224))
-        hmps_indices = list(range(random_hmps.shape[1]))
-        random_half_hmps = random_hmps[:, np.random.choice(hmps_indices, int(len(hmps_indices)/2), replace=False), :, :].mean(1)
-        random_hmps = random_hmps.mean(1)
-
-        hmps = (hmps - hmps.min()) / (hmps.max() - hmps.min())
-        half_hmps = (half_hmps - half_hmps.min())/ (half_hmps.max() - half_hmps.min())
-        random_hmps = (random_hmps - random_hmps.min()) / (random_hmps.max() - random_hmps.min())
-        random_half_hmps = (random_half_hmps - random_half_hmps.min()) / (random_half_hmps.max() - random_half_hmps.min())
-
-        # Get topk model saliency points and half top k to match sparisty of hmps and half hmps
-        full_saliency = saliency
-        topk_saliency = saliency.clone()
-        halfk_saliency = saliency.clone()
-
-        topk_saliency = utils.gaussian_blur(topk_saliency.to(device).unsqueeze(0), kernel)
-        halfk_saliency = utils.gaussian_blur(halfk_saliency.to(device).unsqueeze(0), kernel)
-        full_saliency = utils.gaussian_blur(full_saliency.to(device).unsqueeze(0), kernel)
-        # Double convolve
-        topk_saliency = utils.gaussian_blur(topk_saliency, kernel).squeeze()
-        halfk_saliency = utils.gaussian_blur(halfk_saliency, kernel).squeeze()
-        full_saliency = utils.gaussian_blur(full_saliency, kernel).squeeze()
-
-        k = torch.sum(hmps>0)
-        flat_saliency = topk_saliency.flatten()
-        topk, indices = torch.topk(flat_saliency, k)
-        thresh_value = topk[-1]
-        topk_saliency[topk_saliency<thresh_value] = 0
-
-        k = torch.sum(half_hmps>0)
-        flat_saliency = halfk_saliency.flatten()
-        topk, indices = torch.topk(flat_saliency, k)
-        thresh_value = topk[-1]
-        halfk_saliency[halfk_saliency<thresh_value] = 0
-
-        full_saliency = full_saliency.detach().cpu().numpy()
-        topk_saliency = topk_saliency.detach().cpu().numpy()
-        halfk_saliency = halfk_saliency.detach().cpu().numpy()
-        hmps = hmps.detach().cpu().numpy()
-        random_hmps = random_hmps.detach().cpu().numpy()
-        half_hmps = half_hmps.detach().cpu().numpy()
-        random_half_hmps = random_half_hmps.detach().cpu().numpy()
-
-        # Normalize
-        full_saliency = (full_saliency - full_saliency.min())/(full_saliency.max() - full_saliency.min())
-        topk_saliency = (topk_saliency - topk_saliency.min())/(topk_saliency.max() - topk_saliency.min())
-        halfk_saliency = (halfk_saliency - halfk_saliency.min())/(halfk_saliency.max() - halfk_saliency.min())
-
-        # Compute AUC
-        full_auc = clickme_utils.compute_AUC(full_saliency, hmps)
-        topk_auc = clickme_utils.compute_AUC(topk_saliency, hmps)
-        halfk_auc = clickme_utils.compute_AUC(halfk_saliency, half_hmps)
-        
-        # Compute null AUC vs random map
-        full_null_auc = clickme_utils.compute_AUC(full_saliency, random_hmps)
-        topk_null_auc = clickme_utils.compute_AUC(topk_saliency, random_hmps)
-        halfk_null_auc = clickme_utils.compute_AUC(halfk_saliency, random_half_hmps)
-
-        # Compute spearman
-        full_spearman = clickme_utils.compute_spearman_correlation(full_saliency, hmps)
-        topk_spearman = clickme_utils.compute_spearman_correlation(topk_saliency, hmps)
-        halfk_spearman = clickme_utils.compute_spearman_correlation(halfk_saliency, half_hmps)
-
-        full_null_spearman = clickme_utils.compute_spearman_correlation(full_saliency, random_hmps)
-        topk_null_spearman = clickme_utils.compute_spearman_correlation(topk_saliency, random_hmps)
-        halfk_null_spearman = clickme_utils.compute_spearman_correlation(halfk_saliency, random_half_hmps)
-
-        #Scale to human ceiling percentage
-        topk_auc /= auc_ceiling
-        full_auc /= auc_ceiling
-        halfk_auc /= auc_ceiling
-        
-        topk_null_auc /= auc_ceiling
-        full_null_auc /= auc_ceiling
-        halfk_null_auc /= auc_ceiling
-
-        topk_spearman /= spearman_ceiling
-        full_spearman /= spearman_ceiling
-        halfk_spearman /= spearman_ceiling
-        
-        topk_null_spearman /= spearman_ceiling
-        full_null_spearman /= spearman_ceiling
-        halfk_null_spearman /= spearman_ceiling
-
-
-
-        alignment_scores['full_auc'].append(full_auc)
-        alignment_scores['topk_auc'].append(topk_auc)
-        alignment_scores['halfk_auc'].append(halfk_auc)
-
-        null_scores['full_auc'].append(full_null_auc)
-        null_scores['topk_auc'].append(topk_null_auc)
-        null_scores['halfk_auc'].append(halfk_null_auc)
-
-        alignment_scores['full_spearman'].append(full_spearman)
-        alignment_scores['topk_spearman'].append(topk_spearman)
-        alignment_scores['halfk_spearman'].append(halfk_spearman)
-
-        null_scores['full_spearman'].append(full_null_spearman)
-        null_scores['topk_spearman'].append(topk_null_spearman)
-        null_scores['halfk_spearman'].append(halfk_null_spearman)
-
-        # Save image for wandb log
-        if len(visualize)>0 and i in visualize:
-            hmps_img = hmps.squeeze()
-            f = plt.figure()
-            plt.subplot(1, 6, 1)
-            plt.imshow(full_saliency.squeeze())
-            plt.axis("off")
-            plt.subplot(1, 6, 2)
-            plt.imshow(topk_saliency.squeeze())
-            plt.axis("off")
-            plt.subplot(1, 6, 3)
-            plt.imshow(halfk_saliency.squeeze())
-            plt.axis("off")
-            plt.subplot(1, 6, 4)
-            hmps_img = (hmps_img - np.min(hmps_img))/np.max(hmps_img)
-            plt.imshow(hmps_img)
-            plt.axis("off")
-            plt.subplot(1, 6, 5)
-            plt.imshow(img)
-            plt.axis("off")
-
-            f.tight_layout(pad=0)
-            f.canvas.draw()
-            buf = f.canvas.buffer_rgba()
-            ncols, nrows = f.canvas.get_width_height()
-            image = np.frombuffer(buf, dtype=np.uint8).reshape(nrows, ncols, 4)
-            image = torch.unsqueeze(torch.Tensor(image), 0)
-            image = image[:, int(math.floor(image.shape[1]/4)):int(image.shape[1] - math.floor(image.shape[1]/4)), :, :]
-            sample_maps.append(image)
-            plt.close()
-
-    if return_acc:      
-        avg_test_acc = sum(all_test_acc)/float(len(all_test_acc))
-    else:
-        avg_test_acc = 0
-    if log_writer is not None:
-        log_writer.update(heatmaps=sample_maps, head=f"{test_data_loader.dataset.dataset_name}_eval")
-    return avg_test_acc, alignment_scores, null_scores
-
-
+            log_writer.update(full_null_spearman=np.mean(imgnet_null['full_spearman']), head='imgnet_eval')
+            log_writer.update(unnorm_spearman=np.mean(imgnet_align['unnorm_spearman']), head='imgnet_eval', commit=True)
+    return best_acc

@@ -20,23 +20,17 @@ from src.util.metrics import create_label_index_map
 from torchvision import datasets, transforms
 from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-
+    
 class DataAugmentationForVideoMAE(object):
     def __init__(self, args):
-
-        # self.input_mean = [0.485, 0.456, 0.406]  # IMAGENET1k_DEFAULT_MEAN
-        # self.input_std = [0.229, 0.224, 0.225]  # IMAGENET1k_DEFAULT_STD
-        #if 'beit' in args.model:
-        # self.input_mean = [0.5, 0.5, 0.5]  # IMAGENET21k_DEFAULT_MEAN
-        # self.input_std = [0.5, 0.5, 0.5]  # IMAGENET21k_DEFAULT_STD
         self.input_mean = args.mean
         self.input_std = args.std
         normalize = GroupNormalize(self.input_mean, self.input_std)
         self.train_augmentation = GroupMultiScaleCrop(args.input_size, [1,.875, .75, .66])
-        self.color_augmentation = GroupColorJitter(contrast=(0.8, 1.2), saturation=(0.5, 1.5), hue=(-0.5, 0.5))
+        # self.color_augmentation = GroupColorJitter(contrast=(0.8, 1.2), saturation=(0.5, 1.5), hue=(-0.5, 0.5))
         self.transform = transforms.Compose([                            
             self.train_augmentation,
-            self.color_augmentation,
+            # self.color_augmentation,
             Stack(roll=False),
             ToTorchFormatTensor(div=True),
             normalize,
@@ -108,7 +102,7 @@ def build_co3d_eval_loader(args, transform=None, return_all=False):
     cifs = "/cifs/data/tserre_lrs/projects/prj_video_imagenet/"
     if not os.path.exists(cifs):
         cifs = "/cifs/data/tserre_lrs/projects/projects/prj_video_imagenet/"
-    train_list_path = args.data_list
+    train_list_path = args.data_path
     data_root = os.path.join(cifs, 'PeRFception/data/co3d_v2/binocular_trajectory/')
     data_path = os.path.join(cifs, 'Evaluation/')
     test_data_path = args.clickmaps_path
@@ -117,7 +111,6 @@ def build_co3d_eval_loader(args, transform=None, return_all=False):
     test_imgnet_path = args.imgnet_clickmaps_path
     test_imgnet_human_resutls = args.imgnet_clickmaps_human_path
     label_to_index_map = create_label_index_map(train_list_path)
-    
     if transform is None:
         transform = transforms.Compose([
             transforms.Resize(256, interpolation=3),
@@ -128,7 +121,6 @@ def build_co3d_eval_loader(args, transform=None, return_all=False):
 
     co3d_dataset_test = AlignmentDataset(numpy_file=test_data_path, human_results_file=test_human_results, label_to_index=label_to_index_map, transform=transform)
     co3d_dataloader_test = DataLoader(co3d_dataset_test, batch_size=1, num_workers=args.num_workers, shuffle=False)
-    
     label_dict = np.load(args.imgnet2co3d_label, allow_pickle=True).item()
     imgnet_dataset_test = AlignmentDataset(numpy_file=test_imgnet_path, human_results_file=test_imgnet_human_resutls,
                                              label_to_index=label_to_index_map, label_dict=label_dict, transform=transform, dataset_name='imgnet')
@@ -151,56 +143,7 @@ def build_co3d_eval_loader(args, transform=None, return_all=False):
                 train_end_frame=40,
                 val_start_frame=41, 
                 val_end_frame=49)
-        co3d_dataloader_train = DataLoader(co3d_dataset_train, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-        co3d_dataloader_val = DataLoader(co3d_dataset_val, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+        co3d_dataloader_train = DataLoader(co3d_dataset_train, batch_size=args.eval_co3d_batch_size, shuffle=False, num_workers=args.num_workers)
+        co3d_dataloader_val = DataLoader(co3d_dataset_val, batch_size=args.eval_co3d_batch_size, shuffle=False, num_workers=args.num_workers)
         return co3d_dataloader_train, co3d_dataloader_val, co3d_dataloader_test, imgnet_dataloader_test
     return co3d_dataloader_test, imgnet_dataloader_test
-
-
-def build_dataset(is_train, args):
-    transform = build_transform(is_train, args)
-
-    root = os.path.join(args.data_path, 'train' if is_train else 'val')
-    dataset = datasets.ImageFolder(root, transform=transform)
-
-    print(dataset)
-
-    return dataset
-
-
-def build_transform(is_train, args):
-    mean = IMAGENET_DEFAULT_MEAN
-    std = IMAGENET_DEFAULT_STD
-    # train transform
-    if is_train:
-        # this should always dispatch to transforms_imagenet_train
-        transform = create_transform(
-            input_size=args.input_size,
-            is_training=True,
-            color_jitter=args.color_jitter,
-            auto_augment=args.aa,
-            interpolation='bicubic',
-            re_prob=args.reprob,
-            re_mode=args.remode,
-            re_count=args.recount,
-            mean=mean,
-            std=std,
-        )
-        return transform
-
-    # eval transform
-    t = []
-    if args.input_size <= 224:
-        crop_pct = 224 / 256
-    else:
-        crop_pct = 1.0
-    size = int(args.input_size / crop_pct)
-    t.append(
-        transforms.Resize(size, interpolation=PIL.Image.BICUBIC),  # to maintain same ratio w.r.t. 224 images
-    )
-    t.append(transforms.CenterCrop(args.input_size))
-
-    t.append(transforms.ToTensor())
-    t.append(transforms.Normalize(mean, std))
-    return transforms.Compose(t)
-

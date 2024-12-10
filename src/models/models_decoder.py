@@ -4,16 +4,46 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from functools import partial
-import modeling_finetune as mae
-from modeling_finetune import _cfg, get_sinusoid_encoding_table
-from timm.models.vision_transformer import PatchEmbed, Block
-
+from timm.models.vision_transformer import PatchEmbed
 from timm.models.registry import register_model
 from timm.models.layers import trunc_normal_ as __call_trunc_normal_
-
+from src.models.models_vit import Block
 from einops.layers.torch import Rearrange, Reduce
 
 class DecoderViT(nn.Module):
+    def __init__(self, num_classes=768, embed_dim=768,
+                 depth=12, num_heads=12, mlp_ratio=4., 
+                 norm_layer=nn.LayerNorm, camera_params_enabled=False,
+                 drop_path_rate=0., attn_drop_rate=0., num_frames=4):
+        super().__init__()
+        self.num_classes = num_classes
+        self.num_frames = num_frames
+        self.camera_params_enabled = camera_params_enabled
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+        self.decoder_blocks = nn.ModuleList([
+            Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=True,
+            norm_layer=norm_layer, attn_drop=attn_drop_rate, drop_path=dpr[i])
+            for i in range(depth)
+        ])
+        self.decoder_norm = norm_layer(embed_dim)
+        self.decoder_pred = nn.Linear(embed_dim, num_classes, bias=True) # decoder to patch
+        
+    def forward(self, x, return_token_num, attn_mask=None):
+        B, N, C = x.shape 
+        for blk in self.decoder_blocks:
+            x = blk(x, attn_mask)
+
+        if self.camera_params_enabled:
+            pc = x.reshape(B*self.num_frames, -1, C)[:, 0, :].reshape(B, self.num_frames, C)
+        if return_token_num > 0:
+            x = self.decoder_pred(self.decoder_norm(x[:, -return_token_num:])) # only return the mask tokens predict pixels
+        else:
+            x = self.decoder_pred(self.decoder_norm(x))
+        if self.camera_params_enabled:
+            return x, pc
+        return x
+
+class DecoderViT_old(nn.Module):
     """ Vision Transformer with support for patch or hybrid CNN input stage
     """
     def __init__(self, patch_size=16, num_classes=768, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4.,
@@ -24,7 +54,7 @@ class DecoderViT(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = nn.ModuleList([
             Block(embed_dim, num_heads, mlp_ratio, qkv_bias=qkv_bias, 
-            k_scale=qk_scale, attn_drop=attn_drop_rate, drop_path=dpr[i] norm_layer=norm_layer)
+            qk_scale=qk_scale, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity

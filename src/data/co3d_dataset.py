@@ -15,10 +15,7 @@ from sklearn import preprocessing
 from src.util.misc import matrix_to_quaternion, camera_to_category
 from turbojpeg import TurboJPEG
 from einops import rearrange
-from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-
 jpegturbo = TurboJPEG()
-
 
 def spatial_sampling(
     frames,
@@ -465,18 +462,20 @@ class AlignmentDataset(Dataset):
         self.dataset_name = dataset_name
         all_data = np.load(numpy_file, allow_pickle=True)
         human_data = np.load(human_results_file, allow_pickle=True)
-        # Weird indexing because I didn't save the dictionary right
-        #all_data = all_data[None][0]
+
         filtered_imgs = human_data['final_clickmaps'].tolist().keys()
-        self.ceiling = np.mean(human_data['ceiling_correlations'].tolist())
-        self.null = np.mean(human_data['null_correlations'].tolist())
-        for img_name in all_data.files:
+        all_ceiling = human_data['ceiling_correlations'].tolist()
+        all_null = human_data['null_correlations'].tolist()
+        self.null = np.mean(all_null)
+        self.ceiling = np.mean(all_ceiling)
+        for i, img_name in enumerate(filtered_imgs):
             cat = img_name.split('/')[0]
             if label_dict is not None:
                 cat = label_dict[cat]
-            if img_name in filtered_imgs:
+            if img_name in all_data.files:
+                heatmaps = all_data[img_name].tolist()['heatmap']
                 self.image_files.append(all_data[img_name].tolist()['image'])
-                self.heatmaps.append(all_data[img_name].tolist()['heatmap'])
+                self.heatmaps.append(heatmaps)
                 self.image_names.append(img_name)
                 self.categories.append(cat)
 
@@ -495,7 +494,6 @@ class AlignmentDataset(Dataset):
             image = self.transform(img_file.convert("RGB"))
         else:
             image = img_file
-        # print("Test:", image.shape)
         cat = self.categories[idx]
         return image, heatmap, numeric_label, img_name, cat
 
@@ -539,7 +537,7 @@ class NerfDataset(torch.utils.data.Dataset):
         
         images, name = self.load_frames(clip, start_frame_idx)
         if self.mae_transform:
-            process_data, _ = self.transform(((images), None)) # T,C,H,W
+            process_data, _ = self.transform(([images], None)) # T,C,H,W
             process_data = process_data.squeeze()
 
         else:
@@ -561,9 +559,9 @@ class NerfDataset(torch.utils.data.Dataset):
             raise RuntimeError(f"{fname} DOES NOT EXIST***********")
         def _read_image(path):
             try:
-                img = read_image(path, ImageReadMode.RGB)
-                #img = Image.open(path).convert("RGB")
-                img = img.unsqueeze(0)
+                #img = read_image(path, ImageReadMode.RGB)
+                img = Image.open(path).convert("RGB")
+                #img = img.unsqueeze(0)
                 return img
             except RuntimeError:
                 raise RuntimeError(f"IMAGE READ FAILED FOR PATH {os.path.join(fname, frames_list[fno])}***********")
