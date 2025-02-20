@@ -1,11 +1,10 @@
 module load libjpeg-turbo
-OUTPUT_DIR='outs/autoreg_vit_small_patch16_cam_1209'
+OUTPUT_DIR='outs/autoreg_vit_small_patch16_cam_combined_data_6_frames_0204'
 export HUGGINGFACE_HUB_CACHE=./pretrained_ckpts
 
-DATA_PATH='data_lists/co3d_train.txt'
-DATA_VAL_PATH='data_lists/co3d_val.txt'
-DATA_ROOT='/oscar/data/tserre/Shared/'
-CKPT_PATH='/cifs/data/tserre_lrs/projects/prj_video_imagenet/TempAkash/vit_small16_timm_weights.bin'
+DATA_PATH='data_lists/combined_train.txt'
+DATA_VAL_PATH='data_lists/combined_val.txt'
+DATA_ROOT='/cifs/data/tserre_lrs/projects/projects/prj_video_imagenet/PeRFception/data/'
 
 
 NCCL_DEBUG=INFO OMP_NUM_THREADS=1  python3 -m torch.distributed.run \
@@ -23,7 +22,7 @@ NCCL_DEBUG=INFO OMP_NUM_THREADS=1  python3 -m torch.distributed.run \
         --batch_size 64 \
         --lr 0.015 \
         --no-binocular \
-        --num_frames 8 \
+        --num_frames 6 \
         --weight_decay 0.01 \
         --sampling_rate 4 \
         --opt adamw \
@@ -47,12 +46,10 @@ NCCL_DEBUG=INFO OMP_NUM_THREADS=1  python3 -m torch.distributed.run \
         --drop_path 0 \
         --categorical_camera \
         --feature_loss \
-        --camera_params \
-        --decoder_pos_embed 3d 
-        #--not_pretrained \
+        --decoder_pos_embed 3d \
+        --dataset co3d_mvimgnet
         #--clip_grad 1 \
         # --decoder_cls \
         # --use_cls \
         # --kl_div
-        #--camera_params \
-        #--decoder_pos_embed 3d \
+        # --camera_params \

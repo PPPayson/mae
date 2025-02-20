@@ -112,6 +112,7 @@ class Block(nn.Module):
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), attn_mask)))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
+    
 
 class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
     """ Vision Transformer with support for global average pooling
@@ -126,7 +127,8 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             self.fc_norm = norm_layer(embed_dim)
 
             del self.norm  # remove the original norm
-
+        self.mean=[0.485, 0.456, 0.406]
+        self.std=[0.229, 0.224, 0.225]
     def forward_features(self, x):
         B = x.shape[0]
         x = self.patch_embed(x)
@@ -167,4 +169,12 @@ def vit_huge_patch14(**kwargs):
     model = VisionTransformer(
         patch_size=14, embed_dim=1280, depth=32, num_heads=16, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
+def vit_small_patch16(**kwargs):
+    """ ViT-Small (ViT-S/16)
+    """
+    model = VisionTransformer(
+        patch_size=16, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4, qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)    
     return model

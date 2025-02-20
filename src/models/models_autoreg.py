@@ -3,16 +3,17 @@ import timm
 import torch
 import torch.nn as nn
 
-from timm.models.vision_transformer import PatchEmbed, Block
 from einops import rearrange
 from src.util.pos_embed import get_2d_sincos_pos_embed, get_3d_sincos_pos_embed
-from src.models.models_encoder import EncoderViT
+# from src.models.models_encoder import EncoderViT
 from src.models.models_decoder import DecoderViT
 from src.util.misc import get_cvm_attn_mask
+from src.models import models_encoder
 
 class AutoregViTtimm(nn.Module):
     def __init__(self,
                 encoder_name='vit_small_patch16_224.augreg_in21k_ft_in1k',
+                backbone_name='EncoderViT',
                 patch_size=16,
                 encoder_embed_dim=1024,
                 decoder_num_classes=768,
@@ -40,10 +41,10 @@ class AutoregViTtimm(nn.Module):
                 **kwargs
                 ):
         super().__init__()
-
         # ---------------------------------------------------------------------
         # Autoreg TIMM encoder
-        self.encoder = EncoderViT(model_name=encoder_name, drop_rate=drop_rate, drop_path_rate=drop_path_rate, pretrained=pretrained)
+        # self.encoder = EncoderViT(model_name=encoder_name, drop_rate=drop_rate, drop_path_rate=drop_path_rate, pretrained=pretrained)
+        self.encoder = models_encoder.__dict__[backbone_name](model_name=encoder_name, drop_rate=drop_rate, drop_path_rate=drop_path_rate, pretrained=pretrained)
         self.model_name = encoder_name
         self.time_steps = num_frames-1
         self.timm_pool = timm_pool
@@ -69,16 +70,20 @@ class AutoregViTtimm(nn.Module):
         )
 
         self.encoder_cls = hasattr(self.encoder.model, 'cls_token') and self.encoder.model.cls_token is not None
-        num_patches = (self.encoder.patch_embed.num_patches + int((decoder_cls and self.encoder_cls)))*self.time_steps
+        # num_patches = (self.encoder.patch_embed.num_patches + int((decoder_cls and self.encoder_cls)))*self.time_steps
+        num_patches = (self.encoder.patch_embed.num_patches)*self.time_steps
+        self.decoder_pos_embed = decoder_pos_embed
         if decoder_pos_embed == '2d':
             self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, decoder_embed_dim), requires_grad=False)
             grid_size = int(self.encoder.patch_embed.num_patches**0.5)
-            self.pos_embed.data.copy_(torch.from_numpy(get_2d_sincos_pos_embed(decoder_embed_dim, (grid_size, grid_size, self.time_steps))).float().unsqueeze(0)) 
+            self.pos_embed.data.copy_(torch.from_numpy(get_2d_sincos_pos_embed(decoder_embed_dim, grid_size)).float().unsqueeze(0))
         elif decoder_pos_embed == '3d':
-            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, decoder_embed_dim), requires_grad=False)
-            grid_size = int(self.encoder.patch_embed.num_patches**0.5)
-            self.pos_embed.data.copy_(torch.from_numpy(get_3d_sincos_pos_embed(decoder_embed_dim, (grid_size, grid_size, self.time_steps))).float().unsqueeze(0))            
-        
+            # self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, decoder_embed_dim), requires_grad=False)
+            # grid_size = int(self.encoder.patch_embed.num_patches**0.5)
+            # self.pos_embed.data.copy_(torch.from_numpy(get_3d_sincos_pos_embed(decoder_embed_dim, (grid_size, grid_size, self.time_steps))).float().unsqueeze(0))            
+            self.temporal_embed = nn.Parameter(torch.zeros(1, self.time_steps, 1, decoder_embed_dim))
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.encoder.patch_embed.num_patches, decoder_embed_dim))
+
         self.camera_params_enabled = camera_params_enabled
         self.categorical_camera = categorical_camera
 
@@ -98,9 +103,14 @@ class AutoregViTtimm(nn.Module):
                 self.camera_decoder = nn.Sequential(
                     nn.Linear(decoder_embed_dim, camera_categories)
                 )
+                
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'pos_embed', 'cls_token', 'mask_token', 'temporal_embed'}
 
-    def forward(self, x, camera):
+    def forward(self, x, camera=None, mask=None):
         x = x[:, :, :self.time_steps, :, :] # Leave out last frame for prediction only
+        batch_size = x.shape[0]
         x = rearrange(x, 'b c t h w -> (b t) c h w') # Merge timestep into batch size for encoding
         encoder_features = self.encoder(x, f2d=True)
         x = self.encoder_to_decoder(encoder_features)
@@ -111,17 +121,27 @@ class AutoregViTtimm(nn.Module):
             # Global average pooling
             encoder_features = torch.mean(encoder_features, dim=1)
         
-        if self.encoder_cls and not self.decoder_cls:
+        if self.encoder_cls:
             x_cls_token = x[:, :1, :]
             x = x [:, 1:, :]
-        x = rearrange(x, '(b t) n c -> b (t n) c', t=self.time_steps)
-        B, N, C = x.shape
-        expand_pos_embed = self.pos_embed.expand(B, -1, -1).type_as(x).to(x.device)
-        x = x + expand_pos_embed
-        x = rearrange(x, 'b (t n) c -> (b t) n c', t=self.time_steps)
+
+        if self.decoder_pos_embed == '3d':
+            expand_temporal_embed = self.temporal_embed.expand(batch_size, -1, -1, -1).type_as(x).to(x.device)
+            expand_temporal_embed = rearrange(expand_temporal_embed, 'b t n c -> (b t) n c')
+            x = x + self.pos_embed + expand_temporal_embed
+        else:
+            x = rearrange(x, '(b t) n c -> b (t n) c', t=self.time_steps)
+            B, N, C = x.shape
+            expand_pos_embed = self.pos_embed.expand(B, -1, -1).type_as(x).to(x.device)
+            x = x + expand_pos_embed
+            x = rearrange(x, 'b (t n) c -> (b t) n c', t=self.time_steps)
         num_patches = self.encoder.patch_embed.num_patches
         if self.encoder_cls and self.decoder_cls:
             num_patches += 1
+            x = torch.cat((
+                x_cls_token,
+                x
+            ), dim=1)
         if self.camera_params_enabled:
             num_patches += 1
             cam_embed = self.camera_encoder(camera) #B, T, decoder_dim
@@ -160,9 +180,6 @@ class AutoregViTtimm(nn.Module):
         }
         return output
 
-
-
-
 def autoreg_vit_small_patch16_dec192d4(**kwargs):
     model = AutoregViTtimm(
         patch_size=16, encoder_embed_dim=384, depth=12, num_heads=6,
@@ -170,4 +187,11 @@ def autoreg_vit_small_patch16_dec192d4(**kwargs):
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model 
 
+def autoreg_beitv2_large_patch16_dec512d8(**kwargs):
+    model = AutoregViTtimm(encoder_name='beitv2_large_patch16_224.in1k_ft_in22k_in1k', backbone_name='EncoderBeit', 
+                        patch_size=16, encoder_embed_dim=1024, depth=24, num_heads=16, decoder_embed_dim=512,
+                        decoder_depth=8, decoder_num_heads=16, mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
+
 autoreg_vit_small_patch16 = autoreg_vit_small_patch16_dec192d4 # decoder: 192 dim, 4 blocks
+autoreg_beit_large_patch16 = autoreg_beitv2_large_patch16_dec512d8

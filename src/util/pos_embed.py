@@ -8,10 +8,23 @@
 # --------------------------------------------------------
 
 import numpy as np
-
 import torch
+from einops import rearrange
 
+# sin-cos position encoding
+# https://github.com/jadore801120/attention-is-all-you-need-pytorch/blob/master/transformer/Models.py#L31
+def get_sinusoid_encoding_table(n_position, d_hid): 
+    ''' Sinusoid position encoding table ''' 
+    # TODO: make it with torch instead of numpy 
+    def get_position_angle_vec(position): 
+        return [position / np.power(10000, 2 * (hid_j // 2) / d_hid) for hid_j in range(d_hid)] 
 
+    sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(n_position)]) 
+    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2]) # dim 2i 
+    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2]) # dim 2i+1 
+
+    return  torch.tensor(sinusoid_table,dtype=torch.float, requires_grad=False).unsqueeze(0) 
+    
 def get_3d_sincos_pos_embed(embed_dim, grid_sizes, cls_token=False):
     print(grid_sizes)
     grid_h = np.arange(grid_sizes[0], dtype=np.float32)
@@ -22,6 +35,12 @@ def get_3d_sincos_pos_embed(embed_dim, grid_sizes, cls_token=False):
     
     grid = grid.reshape([3, 1, grid_sizes[2], grid_sizes[0], grid_sizes[1]])
     pos_embed = get_3d_sincos_pos_embed_from_grid(embed_dim, grid)
+    if cls_token:
+        pos_embed = rearrange(pos_embed, '(h w t) n -> (h w) t n', h=grid_sizes[0], w=grid_sizes[1], t=grid_sizes[2], n=embed_dim)
+        print(pos_embed.shape)
+        pos_embed = np.concatenate([np.zeros([1, 7, embed_dim]), pos_embed], axis=0)
+        print(pos_embed.shape)
+        pos_embed = rearrange(pos_embed, 's t n -> (s t) n')
     print("POS EMBED SHAPE:", pos_embed.shape)
     return pos_embed
 

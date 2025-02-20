@@ -31,7 +31,7 @@ from src.engine_eval import eval_alignment, eval_co3d, autoreg_eval_one_epoch
 from src.data.datasets import build_co3d_eval_loader, build_pretraining_dataset
 from src.util.save_features import load_logits
 
-def get_args():
+def get_args_parser():
     parser = argparse.ArgumentParser('Autoregressive Vision Model pre-training script', add_help=False)
     parser.add_argument('--batch_size', default=64, type=int)
     parser.add_argument('--epochs', default=800, type=int)
@@ -44,12 +44,10 @@ def get_args():
     parser.add_argument('--eval_co3d_lr', default=5e-4, type=float)
 
     # Model parameters
-    parser.add_argument('--ckpt_path', default='/cifs/data/tserre_lrs/projects/prj_video_imagenet/TempAkash/vit_small16_timm_weights.bin',
-                        type=str, help='Model checkpoint file path')
+    parser.add_argument('--ckpt_path', type=str, help='Model checkpoint file path')
     parser.add_argument('--model', default='pretrain_videomae_small_patch16_224', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--timm_pool', default=False, action='store_true')
-    parser.add_argument('--encoder_name', default='vit_small_patch16_224.augreg_in21k_ft_in1k', type=str, help='Name of timm pretrained encoder')
     parser.add_argument('--decoder_pos_embed', type=str, default='1d_spatial', choices=['1d_spatial', '1d_temporal', '2d', '3d'])
     parser.add_argument('--decoder_cls', default=False, action='store_true', help='Use cls token in the decoder')
     parser.add_argument('--mask_type', default='tube', choices=['random', 'tube', 'causal', 'causal_interpol', 'autoregressive'],
@@ -111,7 +109,7 @@ def get_args():
                         help='Training interpolation (random, bilinear, bicubic default: "bicubic")')
 
     # Dataset parameters
-    parser.add_argument('--dataset', default='co3d', type=str, choices=['co3d', 'mvimgnet', 'co3d_mvimgnet'])
+    parser.add_argument('--dataset', default='co3d', type=str, choices=['co3d', 'mvimgnet', 'co3d_mvimgnet', 'imgnet', 'co3d_video'])
     parser.add_argument('--data_root', required=True, type=str, help='dataset root directory')
     parser.add_argument('--data_path', default='/path/to/list_kinetics-400', type=str,
                         help='dataset path')
@@ -173,11 +171,10 @@ def get_args():
     parser.add_argument('--camera_param_dim', type=int, default=7)
     parser.add_argument('--camera_params', action='store_true', default=False, help='Train with Camera Parameters in the Decoder')
     parser.add_argument('--no_wandb', default=False, action="store_true")
-    return parser.parse_args()
+    return parser
 
 def get_model(args):
     model = models_autoreg.__dict__[args.model](
-        encoder_name=args.encoder_name,
         pretrained=not args.not_pretrained,
         drop_path_rate=args.drop_path,
         drop_block_rate=None,
@@ -290,6 +287,8 @@ def main(args):
     print("Model = %s" % str(model_without_ddp))
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params: {} M'.format(n_parameters / 1e6))
+    # for idx, (name, param) in enumerate(model_without_ddp.named_parameters()):
+    #     print(f"Index: {idx}, Name: {name}, Shape: {param.shape}")
 
     eff_batch_size = args.batch_size * misc.get_world_size()
     
@@ -301,13 +300,15 @@ def main(args):
 
     print("effective batch size: %d" % eff_batch_size)
     model_without_ddp = model
-    
+    # for p in model_without_ddp.encoder.parameters():
+    #     p.requires_grad=False
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=False)
         model_without_ddp = model.module
         if args.feature_loss:
             linear_model = torch.nn.parallel.DistributedDataParallel(linear_model, device_ids=[args.gpu], find_unused_parameters=False)
             linear_model_without_ddp = linear_model.module
+
 
     if linear_model is not None:
         model_opt = (model, linear_model)
@@ -341,13 +342,42 @@ def main(args):
     start_time = time.time()
     best_acc = 0
     best_epoch = 0
+    acc = eval_co3d(model_without_ddp, co3d_train_dataloader,
+                co3d_val_dataloader, co3d_test_dataloader, 
+                imgnet_test_dataloader, device, -1, num_epochs=args.eval_co3d_epochs, 
+                batch_size=args.batch_size, learning_rate=5e-4, log_writer=log_writer,
+                num_workers=args.num_workers, args=args, eval_align=True)
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
             data_loader_val.sampler.set_epoch(epoch)
+
+        # if epoch == 10:
+        #     for p in model_without_ddp.encoder.parameters():
+        #         p.requires_grad=True
+            # if args.distributed:
+            #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=False)
+            #     model_without_ddp = model.module
+        # if linear_model is not None:
+        #     model_opt = (model, linear_model)
+        # else:
+        #     model_opt = model
+        # if args.schedule_free:
+        #     args.opt = 'adamWScheduleFree'
+        #     if args.warmup_epochs > 0 and args.warmup_steps <= 0:
+        #         args.warmup_steps = args.warmup_epochs * num_training_steps_per_epoch
+        #     optimizer = create_optimizer(args, model_opt, filter_bias_and_bn=False)
+        # else:
+        #     optimizer = create_optimizer(args, model_opt)                    
+
         train_stats = autoreg_train_one_epoch(
             model, data_loader_train,
             optimizer, device, epoch, loss_scaler,
+            model_without_ddp,
+            co3d_train_dataloader,
+            co3d_val_dataloader,
+            co3d_test_dataloader,
+            imgnet_test_dataloader,
             max_norm=args.clip_grad,
             start_steps=epoch*num_training_steps_per_epoch,
             patch_size=patch_size[0],
@@ -378,11 +408,12 @@ def main(args):
             feature_loss=args.feature_loss,
             alpha=(args.alpha_c, args.alpha_f),
             args=args)
-        acc = eval_co3d(model_without_ddp, co3d_train_dataloader,
+        eval_outputs = eval_co3d(model_without_ddp, co3d_train_dataloader,
                     co3d_val_dataloader, co3d_test_dataloader, 
-                    imgnet_test_dataloader, device, epoch, num_epochs=50, 
+                    imgnet_test_dataloader, device, epoch, num_epochs=args.eval_co3d_epochs, 
                     batch_size=args.batch_size, learning_rate=5e-4, log_writer=log_writer,
                     num_workers=args.num_workers, args=args, eval_align=True)
+        acc = eval_outputs['acc']
         if acc > best_acc:
             best_acc = acc
             best_epoch = epoch
@@ -404,7 +435,7 @@ def main(args):
         print(f'Best Epoch {best_epoch}')
 
 if __name__ == '__main__':
-    opts = get_args()
+    opts = get_args_parser().parse_args()
     if opts.output_dir:
         Path(opts.output_dir).mkdir(parents=True, exist_ok=True)
     main(opts)

@@ -3,13 +3,15 @@ import timm
 import os
 from src.data.datasets import build_frames_dataset
 from src.util.save_features import get_features
-from main_pretrain_autoreg import get_args
+from main_pretrain_autoreg import get_args_parser
 
 def extract_features(args):
     device = torch.device(args.device)
     feature_path = args.features_path
     if  'autoreg_vit_small_patch16' in args.model:
         model_name = 'vit_small_patch16_224.augreg_in21k_ft_in1k'
+    if 'autoreg_beit_large_patch16' in args.model:
+        model_name = 'beitv2_large_patch16_224.in1k_ft_in22k_in1k'
     else:
         model_name = args.model
     model = timm.create_model(
@@ -42,6 +44,6 @@ def extract_features(args):
         torch.save(val_tuple, os.path.join(args.features_path, val_feature_name))
 
 if __name__ == '__main__':
-    opts = get_args()
+    opts = get_args_parser().parse_args()
     torch.multiprocessing.set_sharing_strategy('file_system')
     extract_features(opts)

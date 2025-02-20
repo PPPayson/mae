@@ -11,12 +11,14 @@
 import os
 import json
 import PIL
+from pathlib import Path
 from torchvision import transforms
 from src.data.transforms import *
 from src.data.masking_generator import TubeMaskingGenerator, RandomMaskingGenerator, CausalMaskingGenerator, CausalInterpolationMaskingGenerator, AutoregressiveMaskingGenereator
 from src.data.co3d_dataset import Co3dLpDataset, AlignmentDataset, NerfDataset, MultiviewDataset
+from src.data.vpt_dataset import PerspectiveDataset
 from torch.utils.data import DataLoader
-from src.util.metrics import create_label_index_map
+from src.util.metrics import create_label_index_map, create_label_index_map_imgnet
 from torchvision import datasets, transforms
 from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
@@ -27,9 +29,12 @@ class DataAugmentationForVideoMAE(object):
         self.input_std = args.std
         normalize = GroupNormalize(self.input_mean, self.input_std)
         self.train_augmentation = GroupMultiScaleCrop(args.input_size, [1,.875, .75, .66])
+        # self.train_augmentation = GroupMultiScaleCrop(args.input_size, [1])
         # self.color_augmentation = GroupColorJitter(contrast=(0.8, 1.2), saturation=(0.5, 1.5), hue=(-0.5, 0.5))
+        # self.random_horizontal_flip = GroupRandomFlip()
         self.transform = transforms.Compose([                            
             self.train_augmentation,
+            # self.random_horizontal_flip,
             # self.color_augmentation,
             Stack(roll=False),
             ToTorchFormatTensor(div=True),
@@ -90,15 +95,34 @@ def build_pretraining_dataset(args, is_train=True):
         new_length=args.num_frames,
         new_step=args.sampling_rate,
         transform=transform,
-        is_binocular=args.binocular,
-        reverse_sequence=args.reverse_sequence,
+        is_binocular=False,
+        reverse_sequence=False,
         length_divisor=args.data_length_divisor,
         camera_parameters_enabled=args.camera_params
     )
     print("Data Aug = %s" % str(transform))
     return dataset
 
-def build_co3d_eval_loader(args, transform=None, return_all=False):
+def build_vpt_eval_loader(args):
+    transform = transforms.Compose([
+        transforms.Resize(256, interpolation=3),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=args.mean, std=args.std)])
+
+    train_dataset = datasets.ImageFolder(os.path.join(args.data_dir, 'train_flip'), transform=transform)
+    test_dataset = datasets.ImageFolder(os.path.join(args.data_dir, 'test'), transform=transform)
+    val_dataset = datasets.ImageFolder(os.path.join(args.data_dir, 'val'), transform=transform)
+    human_dataset = PerspectiveDataset(Path(args.data_dir).parent, transforms=transform, split='human', task=args.task)
+    
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True, drop_last=False)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True)
+    human_loader = DataLoader(human_dataset, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True)
+
+    return train_loader, val_loader, test_loader, human_loader
+
+def build_co3d_eval_loader(args, transform=None, return_all=False, convert2co3d=True):
     cifs = "/cifs/data/tserre_lrs/projects/prj_video_imagenet/"
     if not os.path.exists(cifs):
         cifs = "/cifs/data/tserre_lrs/projects/projects/prj_video_imagenet/"
@@ -121,7 +145,12 @@ def build_co3d_eval_loader(args, transform=None, return_all=False):
 
     co3d_dataset_test = AlignmentDataset(numpy_file=test_data_path, human_results_file=test_human_results, label_to_index=label_to_index_map, transform=transform)
     co3d_dataloader_test = DataLoader(co3d_dataset_test, batch_size=1, num_workers=args.num_workers, shuffle=False)
-    label_dict = np.load(args.imgnet2co3d_label, allow_pickle=True).item()
+    if convert2co3d:
+        label_dict = np.load(args.imgnet2co3d_label, allow_pickle=True).item()
+    else:
+        label_dict = None
+        label_to_index_map = create_label_index_map_imgnet(args.data_root)
+
     imgnet_dataset_test = AlignmentDataset(numpy_file=test_imgnet_path, human_results_file=test_imgnet_human_resutls,
                                              label_to_index=label_to_index_map, label_dict=label_dict, transform=transform, dataset_name='imgnet')
     imgnet_dataloader_test = DataLoader(imgnet_dataset_test, batch_size=1, num_workers=args.num_workers, shuffle=False)

@@ -17,10 +17,12 @@ from collections import defaultdict, deque
 from pathlib import Path
 import wandb
 import torch
+from torch import nn
 import torch.distributed as dist
 #from torch._six import inf
 import math
 import random
+import io
 import numpy as np
 from datetime import timedelta
 from torchvision.utils import make_grid
@@ -30,6 +32,9 @@ from torchvision.transforms import Compose, ToTensor
 from timm.utils import get_state_dict
 from scipy.spatial.transform import Rotation as R
 from timm.data.transforms import str_to_interp_mode
+from timm.layers.helpers import to_2tuple
+from src.util.dino import cancel_gradients_last_layer
+
 
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
@@ -76,7 +81,7 @@ class WandBLogger(object):
             if "frames" in k:
                 # import pdb; pdb.set_trace()
                 v = torch.cat(v)
-                img_grid = make_grid(v, nrow=8, normalize=not True, scale_each=not True)
+                img_grid = make_grid(v, nrow=self.args.num_frames, normalize=not True, scale_each=not True)
                 img_grid = F.to_pil_image(img_grid.clip(0,0.996))
                 # img_grid = Image.fromarray((img_grid.movedim(0,2).cpu().numpy() * 255).astype(np.uint8))
                 img_grid = wandb.Image(img_grid, caption=f"input _ pred _ label")
@@ -314,9 +319,8 @@ def init_distributed_mode(args):
         setup_for_distributed(is_master=True)  # hack
         args.distributed = False
         return
-
+    print(args.gpu)
     args.distributed = True
-
     torch.cuda.set_device(args.gpu)
     args.dist_backend = 'nccl'
     print('| distributed init (rank {}): {}, gpu {}'.format(
@@ -333,7 +337,7 @@ class NativeScalerWithGradNormCount:
     def __init__(self):
         self._scaler = torch.cuda.amp.GradScaler()
 
-    def __call__(self, loss, optimizer, clip_grad=None, parameters=None, create_graph=False, update_grad=True):
+    def __call__(self, loss, optimizer, clip_grad=None, parameters=None, create_graph=False, update_grad=True, freeze_last_layer=-1, epoch=0, model=None):
         self._scaler.scale(loss).backward(create_graph=create_graph)
         if update_grad:
             if clip_grad is not None:
@@ -343,6 +347,7 @@ class NativeScalerWithGradNormCount:
             else:
                 self._scaler.unscale_(optimizer)
                 norm = get_grad_norm_(parameters)
+            cancel_gradients_last_layer(epoch, model, freeze_last_layer)
             self._scaler.step(optimizer)
             self._scaler.update()
         else:
@@ -481,9 +486,9 @@ def get_transform_wo_crop(data_config):
     return transforms.Compose(tf)
 
 
-def get_cvm_attn_mask(q_len, num_frames):
+def get_cvm_attn_mask(q_len, num_frames, offset=0):
     q_len = q_len // num_frames
-    attn_mask = torch.tril(torch.ones((num_frames, num_frames))).to(torch.bool)
+    attn_mask = torch.tril(torch.ones((num_frames, num_frames)), diagonal=offset).to(torch.bool)
     attn_mask = attn_mask.repeat_interleave(q_len, dim=1, output_size=q_len*num_frames).repeat_interleave(q_len, dim=0, output_size=q_len*num_frames)
     return attn_mask
 
@@ -588,3 +593,59 @@ def _load_checkpoint_for_ema(model_ema, checkpoint):
     torch.save(checkpoint, mem_file)
     mem_file.seek(0)
     model_ema._load_checkpoint(mem_file)
+
+
+# Origin: https://raw.githubusercontent.com/facebookresearch/jepa/3081b0ad7b9651373ccef40c1d46b62f46cb7146/src/models/utils/patch_embed.py
+class PatchEmbed(nn.Module):
+    """
+    Image to Patch Embedding
+    """
+    def __init__(
+        self,
+        patch_size=16,
+        in_chans=3,
+        embed_dim=768
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = self.proj(x).flatten(2).transpose(1, 2)
+        return x
+
+
+class PatchEmbed3D(nn.Module):
+    """
+    Image to Patch Embedding
+    """
+
+    def __init__(
+        self,
+        img_size=224,
+        patch_size=16,
+        tubelet_size=2,
+        in_chans=3,
+        embed_dim=768,
+    ):
+        super().__init__()
+        self.patch_size = to_2tuple(patch_size)
+        self.tubelet_size = tubelet_size
+        self.grid_size = tuple([s // p for s, p in zip(img_size, self.patch_size)])
+        self.num_patches = self.grid_size[0] * self.grid_size[1]
+        self.img_size = to_2tuple(img_size)
+        print("tubelet_size", tubelet_size)
+        self.proj = nn.Conv3d(
+            in_channels=in_chans,
+            out_channels=embed_dim,
+            kernel_size=(tubelet_size, patch_size[0], patch_size[1]),
+            stride=(tubelet_size, patch_size[1], patch_size[0]),
+        )
+
+    def forward(self, x, **kwargs):
+        B, C, T, H, W = x.shape
+        print(x.shape)
+        x = self.proj(x).flatten(2).transpose(1, 2) #NLC
+        print(x.shape)
+        return x

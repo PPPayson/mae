@@ -179,10 +179,6 @@ class MultiviewDataset(torch.utils.data.Dataset):
                                "Check your data directory (opt.data-dir)."))
 
     def set_logits(self, encoder_logits, encoder_labels):
-        # self.encoder_logits = [[] for i in range(len(self.clips))]
-        # for i in range(len(encoder_logits)):
-        #     clip_idx = self.start_indices[i][0]
-        #     self.encoder_logits[clip_idx].append(encoder_logits[i])
         self.encoder_logits = []
         cur_idx = 0
         for i in range(len(self.num_frames_per_clip)):
@@ -221,7 +217,7 @@ class MultiviewDataset(torch.utils.data.Dataset):
                 mask = np.tile(mask, (1, 2, 1))
 
             process_data = process_data.view((self.new_length, 3) + process_data.size()[-2:]).transpose(0,1)  # T*C,H,W -> T,C,H,W -> C,T,H,W
-            if self.encoder_logits != None:
+            if self.encoder_logits is not None:
                 features = torch.vstack(features)
                 return (process_data, mask, features, label)
             return (process_data, mask, label)
@@ -467,13 +463,15 @@ class AlignmentDataset(Dataset):
         all_ceiling = human_data['ceiling_correlations'].tolist()
         all_null = human_data['null_correlations'].tolist()
         self.null = np.mean(all_null)
-        self.ceiling = np.mean(all_ceiling)
+        # self.ceiling = np.mean(all_ceiling)
+        self.ceiling = []
         for i, img_name in enumerate(filtered_imgs):
             cat = img_name.split('/')[0]
             if label_dict is not None:
                 cat = label_dict[cat]
-            if img_name in all_data.files:
+            if img_name in all_data.files and all_ceiling[i] > 0:
                 heatmaps = all_data[img_name].tolist()['heatmap']
+                self.ceiling.append(all_ceiling[i])
                 self.image_files.append(all_data[img_name].tolist()['image'])
                 self.heatmaps.append(heatmaps)
                 self.image_names.append(img_name)
@@ -495,7 +493,8 @@ class AlignmentDataset(Dataset):
         else:
             image = img_file
         cat = self.categories[idx]
-        return image, heatmap, numeric_label, img_name, cat
+        ceiling = self.ceiling[idx]
+        return image, heatmap, numeric_label, img_name, cat, ceiling
 
 
 class NerfDataset(torch.utils.data.Dataset):
@@ -559,9 +558,9 @@ class NerfDataset(torch.utils.data.Dataset):
             raise RuntimeError(f"{fname} DOES NOT EXIST***********")
         def _read_image(path):
             try:
-                #img = read_image(path, ImageReadMode.RGB)
+                # img = read_image(path, ImageReadMode.RGB)
                 img = Image.open(path).convert("RGB")
-                #img = img.unsqueeze(0)
+                # img = img.unsqueeze(0)
                 return img
             except RuntimeError:
                 raise RuntimeError(f"IMAGE READ FAILED FOR PATH {os.path.join(fname, frames_list[fno])}***********")

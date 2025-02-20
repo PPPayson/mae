@@ -12,7 +12,7 @@ from scipy.spatial.transform import Rotation as R
 from PIL import Image
 import cv2
 from scipy.ndimage.filters import gaussian_filter
-
+import os
 
 def save_as_overlay(img, mask, filename, percentile=99, save=True):
 
@@ -33,6 +33,12 @@ def save_as_overlay(img, mask, filename, percentile=99, save=True):
         cv2.imwrite(filename, img)
     return img
 
+def create_label_index_map_imgnet(data_path):
+    label_to_index_map = {}
+    categories = sorted(os.listdir(os.path.join(data_path, 'train')))
+    for i, c in enumerate(categories):
+        label_to_index_map[c] = i
+    return label_to_index_map
 
 def create_label_index_map(anchor_file):
         '''

@@ -7,6 +7,18 @@ import torchvision
 from PIL import Image, ImageOps
 import numbers
 
+class GroupRandomFlip(object):
+    def __init__(self, p=0.5):
+        self.p = p
+    
+    def __call__(self, img_tuple):
+        img_group, label = img_tuple
+        out_images = []
+        if torch.rand(1) < self.p:
+            return (img_group, label)
+        for img in img_group:
+            out_images.append(F.hflip(img))
+        return (out_images, label)
 
 class GroupRandomCrop(object):
     def __init__(self, size):

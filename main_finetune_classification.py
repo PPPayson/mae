@@ -8,7 +8,7 @@ import numpy as np
 import random
 import wandb
 from src.util.optim_factory import create_optimizer
-from src.data.datasets import build_frames_dataset, DataAugmentationForVideoMAE
+from src.data.datasets import build_frames_dataset, DataAugmentationForVideoMAE, build_pretraining_dataset
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from scipy.stats import spearmanr
@@ -20,7 +20,8 @@ from torchvision import transforms
 from src.data.co3d_dataset import Co3dLpDataset, AlignmentDataset, NerfDataset, EmbeddingDataset
 from tqdm import tqdm
 from src.util.metrics import create_label_index_map
-
+from einops import rearrange
+torch.multiprocessing.set_sharing_strategy('file_system')
 def get_arg_parser():
     parser = argparse.ArgumentParser("Finetune with Co3D data", allow_abbrev=False)
     parser.add_argument('--ckpt_path', required=False, type=str)
@@ -34,9 +35,13 @@ def get_arg_parser():
                         type=str, help='masked strategy of video tokens/patches')
     parser.add_argument('--mask_ratio', default=0.75, type=float,
                         help='ratio of the visual tokens/patches need be masked')
+    parser.add_argument('--num_frames', type=int, default= 4)
+    parser.add_argument('--sampling_rate', type=int, default= 4)
+    parser.add_argument('--data_length_divisor', default=1, type=int)
+
     parser.add_argument('--drop_path', type=float, default=0.0, metavar='PCT',
                         help='Drop path rate (default: 0.1)')
-    parser.add_argument('--dataset', default='co3d', type=str, choices=['co3d', 'mvimgnet', 'co3d_mvimgnet', 'imgnet'])
+    parser.add_argument('--dataset', default='co3d', type=str, choices=['co3d', 'mvimgnet', 'co3d_mvimgnet', 'imgnet', 'co3d_gs'])
     parser.add_argument('--data_root', required=True, type=str)
     parser.add_argument('--data_path', default='/path/to/list_kinetics-400', type=str,
                         help='dataset path')
@@ -78,6 +83,12 @@ def get_arg_parser():
     parser.add_argument('--local_rank', default=-1, type=int)
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+    
+    parser.add_argument('--categorical_camera', default=False, action='store_true', help='Use 64 categories for camera poses')
+
+    # Camera Parameters
+    parser.add_argument('--camera_param_dim', type=int, default=7)
+    parser.add_argument('--camera_params', action='store_true', default=False, help='Train with Camera Parameters in the Decoder')
     return parser
 
 def create_label_index_map_imgnet(data_path):
@@ -139,6 +150,12 @@ def get_dataloaders(model, args):
     if args.dataset == 'imgnet':
         train_dataset = tv_datasets.ImageFolder(os.path.join(args.data_root, 'train'), transform=transform_train)
         val_dataset = tv_datasets.ImageFolder(os.path.join(args.data_root, 'val'), transform=transform_val)
+    elif args.dataset == 'co3d_gs':
+        args.window_size=(args.num_frames, 14, 14)
+        args.patch_size=(16, 16)
+        train_dataset = build_pretraining_dataset(args)
+        val_dataset = build_frames_dataset(args, is_train=False, transform=transform_val)
+        # val_dataset = build_pretraining_dataset(args, is_train=False)        
     else:
         train_dataset = build_frames_dataset(args, transform=transform_train)
         val_dataset = build_frames_dataset(args, is_train=False, transform=transform_val)
@@ -193,7 +210,7 @@ def extract_features(model, data_loader, device):
 def pretrain_head(model, train_loader, val_loader, epochs, device, args):
     train_features, train_labels = extract_features(model, train_loader, device)
     val_features, val_labels = extract_features(model, val_loader, device)
-    metric_logger = utils.MetricLogger(delimiter='  ')
+    metric_logger = misc.MetricLogger(delimiter='  ')
     header = f'Pretrain Head'
     print_freq = 1
 
@@ -262,20 +279,32 @@ def train(model, model_without_ddp, train_loader, val_loader, test_loader, test_
     imgnet_alignment = np.mean(imgnet_align['full_spearman'])
     with torch.no_grad():
       acc_val, loss_val = evaluate(model, val_loader, criterion, -1, device, log_writer)
-    print('Co3D: alignment:', alignment, 'unnorm alignment', np.mean(alignment_scores['unnorm_spearman']))
-    print('ImgNet: alignment:', imgnet_alignment, 'unnorm alignment', np.mean(imgnet_align['unnorm_spearman']))
-
+    print(f"Accuracy: {acc_val} Co3D Alignment: {np.mean(alignment_scores['full_spearman'])} ImgNet Alignment: {np.mean(imgnet_align['full_spearman'])}")
+    print(f"Co3D Unnorm: {np.mean(alignment_scores['unnorm_spearman'])} ImgNet Unnorm: {np.mean(imgnet_align['unnorm_spearman'])}")
+    print(f"Co3D Topk: {np.mean(alignment_scores['topk_spearman'])} ImgNet TopK: {np.mean(imgnet_align['topk_spearman'])}")
     if log_writer is not None:
-        log_writer.set_step()
         log_writer.update(test_acc=acc_test, head='co3d_eval')
         log_writer.update(full_spearman=np.mean(alignment_scores['full_spearman']), head='co3d_eval')
-        log_writer.update(full_null_spearman=np.mean(null_scores['full_spearman']), head='co3d_eval')
-        log_writer.update(unnorm_spearman=np.mean(alignment_scores['unnorm_spearman']), head='co3d_eval')
+        log_writer.update(full_unnorm=np.mean(alignment_scores['unnorm_spearman']), head='co3d_eval')
+        log_writer.update(full_null=np.mean(null_scores['full_spearman']), head='co3d_eval')
+        log_writer.update(full_null_unnorm=np.mean(null_scores['unnorm_spearman']), head='co3d_eval')
+
+        log_writer.update(topk_spearman=np.mean(alignment_scores['topk_spearman']), head='co3d_eval')
+        log_writer.update(topk_unnorm=np.mean(alignment_scores['unnorm_topk']), head='co3d_eval')
+        log_writer.update(topk_null=np.mean(null_scores['topk_spearman']), head='co3d_eval')
+        log_writer.update(topk_null_unnorm=np.mean(null_scores['unnorm_topk']), head='co3d_eval')
+
 
         log_writer.update(test_acc=imgnet_acc, head='imgnet_eval')
         log_writer.update(full_spearman=np.mean(imgnet_align['full_spearman']), head='imgnet_eval')
-        log_writer.update(full_null_spearman=np.mean(imgnet_null['full_spearman']), head='imgnet_eval')
-        log_writer.update(unnorm_spearman=np.mean(imgnet_align['unnorm_spearman']), head='imgnet_eval', commit=True)
+        log_writer.update(full_unnorm=np.mean(imgnet_align['unnorm_spearman']), head='imgnet_eval')
+        log_writer.update(full_null=np.mean(imgnet_null['full_spearman']), head='imgnet_eval')
+        log_writer.update(full_null_unnorm=np.mean(imgnet_null['unnorm_spearman']), head='imgnet_eval')
+
+        log_writer.update(topk_spearman=np.mean(imgnet_align['topk_spearman']), head='imgnet_eval')
+        log_writer.update(topk_unnorm=np.mean(imgnet_align['unnorm_topk']), head='imgnet_eval')
+        log_writer.update(topk_null=np.mean(imgnet_null['topk_spearman']), head='imgnet_eval')
+        log_writer.update(topk_null_unnorm=np.mean(imgnet_null['unnorm_topk']), head='imgnet_eval')
             
 
     best_acc_val = acc_val
@@ -290,8 +319,14 @@ def train(model, model_without_ddp, train_loader, val_loader, test_loader, test_
         metric_logger = misc.MetricLogger(delimiter="  ")
         print_freq = 50        
         for i, batch in enumerate(metric_logger.log_every(train_loader, print_freq, header)):
-            imgs, labels = batch[0].to(args.device), batch[1].to(args.device)
-            labels = torch.squeeze(labels)
+            if args.dataset == 'co3d_gs':
+                imgs, labels = batch[0].to(args.device), batch[-1].to(args.device)
+                labels = torch.squeeze(labels)
+                imgs = rearrange(imgs, 'b c t h w -> (b t) c h w')
+                labels = rearrange(labels, 'b t -> (b t)')
+            else:
+                imgs, labels = batch[0].to(args.device), batch[1].to(args.device)
+                labels = torch.squeeze(labels)
             optimizer.zero_grad()
 
             preds = model(imgs)
@@ -308,10 +343,10 @@ def train(model, model_without_ddp, train_loader, val_loader, test_loader, test_
         metric_logger.synchronize_between_processes()
         if log_writer is not None:
             log_writer.set_step((start_epoch + epoch+1)*len(train_loader))
-            log_writer.update(loss=metric_logger.loss.avg, head="train")
-            log_writer.update(accuracy=metric_logger.acc.avg, head="train", commit=True)
-        avg_acc = metric_logger.acc.avg
-        avg_loss = metric_logger.loss.avg
+            log_writer.update(loss=metric_logger.loss.global_avg, head="train")
+            log_writer.update(accuracy=metric_logger.acc.global_avg, head="train", commit=True)
+        avg_acc = metric_logger.acc.global_avg
+        avg_loss = metric_logger.loss.global_avg
         with torch.no_grad():
             if log_writer is not None:
                 log_writer.set_step()
@@ -321,17 +356,32 @@ def train(model, model_without_ddp, train_loader, val_loader, test_loader, test_
         
         alignment = np.mean(alignment_scores['full_spearman'])
         imgnet_alignment = np.mean(imgnet_align['full_spearman'])
+        print(f"Accuracy: {acc_val} Co3D Alignment: {np.mean(alignment_scores['full_spearman'])} ImgNet Alignment: {np.mean(imgnet_align['full_spearman'])}")
+        print(f"Co3D Unnorm: {np.mean(alignment_scores['unnorm_spearman'])} ImgNet Unnorm: {np.mean(imgnet_align['unnorm_spearman'])}")
+        print(f"Co3D Topk: {np.mean(alignment_scores['topk_spearman'])} ImgNet TopK: {np.mean(imgnet_align['topk_spearman'])}")
         if log_writer is not None:
-            log_writer.set_step()
             log_writer.update(test_acc=acc_test, head='co3d_eval')
             log_writer.update(full_spearman=np.mean(alignment_scores['full_spearman']), head='co3d_eval')
-            log_writer.update(full_null_spearman=np.mean(null_scores['full_spearman']), head='co3d_eval')
-            log_writer.update(unnorm_spearman=np.mean(alignment_scores['unnorm_spearman']), head='co3d_eval')
+            log_writer.update(full_unnorm=np.mean(alignment_scores['unnorm_spearman']), head='co3d_eval')
+            log_writer.update(full_null=np.mean(null_scores['full_spearman']), head='co3d_eval')
+            log_writer.update(full_null_unnorm=np.mean(null_scores['unnorm_spearman']), head='co3d_eval')
+
+            log_writer.update(topk_spearman=np.mean(alignment_scores['topk_spearman']), head='co3d_eval')
+            log_writer.update(topk_unnorm=np.mean(alignment_scores['unnorm_topk']), head='co3d_eval')
+            log_writer.update(topk_null=np.mean(null_scores['topk_spearman']), head='co3d_eval')
+            log_writer.update(topk_null_unnorm=np.mean(null_scores['unnorm_topk']), head='co3d_eval')
+
 
             log_writer.update(test_acc=imgnet_acc, head='imgnet_eval')
             log_writer.update(full_spearman=np.mean(imgnet_align['full_spearman']), head='imgnet_eval')
-            log_writer.update(full_null_spearman=np.mean(imgnet_null['full_spearman']), head='imgnet_eval')
-            log_writer.update(unnorm_spearman=np.mean(imgnet_align['unnorm_spearman']), head='imgnet_eval', commit=True)
+            log_writer.update(full_unnorm=np.mean(imgnet_align['unnorm_spearman']), head='imgnet_eval')
+            log_writer.update(full_null=np.mean(imgnet_null['full_spearman']), head='imgnet_eval')
+            log_writer.update(full_null_unnorm=np.mean(imgnet_null['unnorm_spearman']), head='imgnet_eval')
+
+            log_writer.update(topk_spearman=np.mean(imgnet_align['topk_spearman']), head='imgnet_eval')
+            log_writer.update(topk_unnorm=np.mean(imgnet_align['unnorm_topk']), head='imgnet_eval')
+            log_writer.update(topk_null=np.mean(imgnet_null['topk_spearman']), head='imgnet_eval')
+            log_writer.update(topk_null_unnorm=np.mean(imgnet_null['unnorm_topk']), head='imgnet_eval')
             if acc_val > best_acc_val:
                 best_epoch = epoch
                 best_acc_val = acc_val
@@ -367,8 +417,8 @@ def evaluate(model, val_loader, criterion, epoch, device, log_writer):
         metric_logger.update(loss=loss)
     metric_logger.synchronize_between_processes()
     
-    avg_acc = metric_logger.acc.avg
-    avg_loss = metric_logger.loss.avg
+    avg_acc = metric_logger.acc.global_avg
+    avg_loss = metric_logger.loss.global_avg
     print(np.mean(accs), avg_acc, num_correct/float(total_num))
     if log_writer is not None:
         log_writer.update(accuracy=avg_acc, head='val')
@@ -434,9 +484,10 @@ def main(args):
         if args.ckpt_path != None:
             ckpt_dict = torch.load(args.ckpt_path)
             for k in list(ckpt_dict.keys()):
-                n_k = k.replace('module.', '')
-                ckpt_dict[n_k] = ckpt_dict[k]
-                del ckpt_dict[k]
+                if 'module.' in k:
+                    n_k = k.replace('module.', '')
+                    ckpt_dict[n_k] = ckpt_dict[k]
+                    del ckpt_dict[k]
             model.load_state_dict(ckpt_dict)
     results = train(model, model_without_ddp, train_loader, val_loader, test_loader, test_imgnet_loader, optimizer, log_writer, device, args.epochs, 0, args)
     for key in results:

@@ -33,4 +33,5 @@ python  main_finetune_classification.py \
     --clickmaps_human_path ./assets/human_ceiling_split_half_jay_imagenet_for_co3d_val_0.1.npz \
     --clickmaps_path ./assets/jay_imagenet_for_co3d_val_0.1_processed.npz \
     --imgnet_clickmaps_path assets/jay_imagenet_val_0.1_processed.npz \
-    --imgnet_clickmaps_human_path assets/human_ceiling_split_half_imagenet_val_0.1.npz
+    --imgnet_clickmaps_human_path assets/human_ceiling_split_half_imagenet_val_0.1.npz \
+    --ckpt_path outs/finetune/imgnet/full/vit_small_patch16_224.augreg_in21k_ft_in1k/best_val.ckpt

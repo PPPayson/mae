@@ -11,7 +11,7 @@ from typing import Iterable
 import timm
 from torchvision import datasets, transforms
 
-def extract_features(model: torch.nn.Module, data_loader: Iterable, device: torch.device, pool: bool):
+def extract_features(model: torch.nn.Module, data_loader: Iterable, device: torch.device, pool: bool, timm_model: bool=False):
     model.eval()
     model.to(device)
     features = []
@@ -20,7 +20,11 @@ def extract_features(model: torch.nn.Module, data_loader: Iterable, device: torc
         with torch.no_grad():
             images, labels = data
             images = images.to(device)
-            preds = model(images, f2d=True, pool=pool)
+            if timm_model:
+                preds = model.forward_head(model.forward_features(images), pre_logits=True)
+                # preds = model.forward_features(images)
+            else:
+                preds = model(images, f2d=True, pool=pool)
             if len(preds.shape) > 2:
                 preds = torch.mean(preds, dim=1)
             features.append(preds.cpu())
@@ -40,25 +44,26 @@ def save_features(encoder, dataset, new_head, args):
         num_workers=args.num_workers,
         pin_memory=False,
         drop_last=False,
-        persistent_workers=True,
+        persistent_workers=False,
     )
     encoder_activations = []
     labels = []
     fnames = []
     with torch.cuda.amp.autocast(enabled=True):
-        for step, batch in enumerate(tqdm(data_loader)):
-            videos, label, fname = batch[0].to(args.device), batch[1], batch[2]
-            # B, C, T, H, W = videos.shape
-            # videos = videos.movedim(1, 2).reshape(B*T, C, H, W)
-            labels.append(label)
-            fnames += fname
-            if new_head:
-                activation = encoder(videos, f2d=True, pool=args.timm_pool).detach().cpu()
-                if not args.timm_pool:
-                    activation = torch.mean(encoder, dim=1)
-            else:
-                activation = encoder(videos).detach().cpu()
-            encoder_activations.append(activation)
+        with torch.no_grad():
+            for step, batch in enumerate(tqdm(data_loader)):
+                videos, label, fname = batch[0].to(args.device), batch[1], batch[2]
+                # B, C, T, H, W = videos.shape
+                # videos = videos.movedim(1, 2).reshape(B*T, C, H, W)
+                labels.append(label)
+                fnames += fname
+                if new_head:
+                    activation = encoder(videos, f2d=True, pool=args.timm_pool).detach().cpu()
+                    if not args.timm_pool:
+                        activation = torch.mean(encoder, dim=1)
+                else:
+                    activation = encoder(videos).detach().cpu()
+                encoder_activations.append(activation)
     encoder_activations = torch.cat(encoder_activations)
     #dataset.reverse_sequence = reverse_sequence
     return encoder_activations, torch.cat(labels), fnames
@@ -175,16 +180,19 @@ def load_logits(encoder, args):
         model_name = args.encoder_name
         model = encoder.eval()
         new_head = True
-        transform = transforms.Compose([
+        transforms = transforms.Compose([
             transforms.Resize(256, interpolation=3),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
             transforms.Normalize(mean=args.mean, std=args.std)])
-    train_feature_name = args.model + '_' + args.dataset + '_logits_train.pt'
-    val_feature_name = args.model + '_' + args.dataset + '_logits_val.pt'
+    # train_feature_name = args.model + '_' + args.dataset + '_logits_train.pt'
+    # val_feature_name = args.model + '_' + args.dataset + '_logits_val.pt'
+    train_feature_name = model_name + '_' + args.dataset + '_logits_train.pt'
+    val_feature_name = model_name + '_' + args.dataset + '_logits_val.pt'
+
     if not (os.path.isfile(os.path.join(feature_path, train_feature_name)) and os.path.isfile(os.path.join(feature_path, val_feature_name))):
-        train_dataset = build_frames_dataset(args)
-        val_dataset = build_frames_dataset(args, is_train=False)
+        train_dataset = build_frames_dataset(args, transform=transforms)
+        val_dataset = build_frames_dataset(args, transform=transforms, is_train=False)
         train_features, train_labels, train_fnames = get_features(model, train_dataset, True, new_head, args)
         val_features, val_labels, val_fnames = get_features(model, val_dataset, False, new_head, args)
         if new_head:

@@ -16,11 +16,11 @@ NCCL_DEBUG=INFO OMP_NUM_THREADS=1  python3 -m torch.distributed.run \
         --data_root ${DATA_ROOT} \
         --data_list ${DATA_LIST} \
         --model mae_vit_small_patch16 \
-        --batch_size 512 \
+        --batch_size 64 \
         --blr 1.5e-4 \
-        --weight_decay 0.05 \
-        --warmup_epochs 40 \
-        --epochs 200 \
+        --weight_decay 0.01 \
+        --warmup_epochs 10 \
+        --epochs 50 \
         --log_dir ${OUTPUT_DIR} \
         --output_dir ${OUTPUT_DIR} \
-        --mask_ratio 0.9
+        --mask_ratio 0.75

@@ -2,10 +2,9 @@ module load libjpeg-turbo
 OUTPUT_DIR='outs/autoreg_vit_small_patch16_cam_1209'
 export HUGGINGFACE_HUB_CACHE=./pretrained_ckpts
 
-DATA_PATH='data_lists/co3d_train.txt'
-DATA_VAL_PATH='data_lists/co3d_val.txt'
-DATA_ROOT='/oscar/data/tserre/Shared/'
-CKPT_PATH='/cifs/data/tserre_lrs/projects/prj_video_imagenet/TempAkash/vit_small16_timm_weights.bin'
+DATA_PATH='data_lists/co3d_video_train.txt'
+DATA_VAL_PATH='data_lists/co3d_video_val.txt'
+DATA_ROOT='/cifs/data/tserre_lrs/projects/projects/prj_video_imagenet/PeRFception/data/'
 
 python -m tools.run_extract_features \
         --num_workers 16 \
@@ -14,8 +13,8 @@ python -m tools.run_extract_features \
         --data_val_path ${DATA_VAL_PATH} \
         --mask_type autoregressive \
         --mask_ratio 0.75 \
-        --model autoreg_vit_small_patch16 \
-        --batch_size 64 \
+        --model autoreg_beit_large_patch16 \
+        --batch_size 512 \
         --lr 0.015 \
         --no-binocular \
         --num_frames 8 \
@@ -42,8 +41,8 @@ python -m tools.run_extract_features \
         --drop_path 0 \
         --categorical_camera \
         --feature_loss \
-        --camera_params \
-        --decoder_pos_embed 3d 
+        --decoder_pos_embed 3d \
+        --dataset co3d
         #--not_pretrained \
         #--clip_grad 1 \
         # --decoder_cls \
