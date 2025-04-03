@@ -1,5 +1,5 @@
 module load libjpeg-turbo
-OUTPUT_DIR='outs/autoreg_beit_large_patch16_no_cam_lr001_0212'
+OUTPUT_DIR='outs/autoreg_beit_large_patch16_no_cam_aug_0227'
 export HUGGINGFACE_HUB_CACHE=./pretrained_ckpts
 
 DATA_PATH='data_lists/co3d_train.txt'
@@ -20,7 +20,7 @@ NCCL_DEBUG=INFO OMP_NUM_THREADS=1  python3 -m torch.distributed.run \
         --mask_ratio 0.75 \
         --model autoreg_beit_large_patch16 \
         --batch_size 16 \
-        --lr 0.001 \
+        --lr 0.0005 \
         --no-binocular \
         --num_frames 8 \
         --weight_decay 0.01 \
@@ -46,7 +46,8 @@ NCCL_DEBUG=INFO OMP_NUM_THREADS=1  python3 -m torch.distributed.run \
         --drop_path 0.1 \
         --categorical_camera \
         --feature_loss \
-        --decoder_pos_embed 3d 
+        --decoder_pos_embed 3d \
+        --photo_trasnform
         #--not_pretrained \
         #--clip_grad 1 \
         # --decoder_cls \

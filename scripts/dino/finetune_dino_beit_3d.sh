@@ -20,8 +20,8 @@ NCCL_DEBUG=INFO OMP_NUM_THREADS=1  python3 -m torch.distributed.run \
         --mask_type autoregressive \
         --mask_ratio 0.75 \
         --model dino_3d_beit_large_patch16 \
-        --batch_size 16 \
-        --lr 0.0005 \
+        --batch_size 8 \
+        --lr 0.0001 \
         --no-binocular \
         --num_frames 8 \
         --weight_decay 0.01 \
@@ -48,6 +48,5 @@ NCCL_DEBUG=INFO OMP_NUM_THREADS=1  python3 -m torch.distributed.run \
         --camera_params \
         --drop_path 0.1 \
         --out_dim 65536 \
-        --pos_embed 2d \
+        --pos_embed rel_3d \
         --timm_pool
-

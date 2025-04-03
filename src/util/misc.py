@@ -628,6 +628,7 @@ class PatchEmbed3D(nn.Module):
         tubelet_size=2,
         in_chans=3,
         embed_dim=768,
+        num_frames=8
     ):
         super().__init__()
         self.patch_size = to_2tuple(patch_size)
@@ -635,7 +636,6 @@ class PatchEmbed3D(nn.Module):
         self.grid_size = tuple([s // p for s, p in zip(img_size, self.patch_size)])
         self.num_patches = self.grid_size[0] * self.grid_size[1]
         self.img_size = to_2tuple(img_size)
-        print("tubelet_size", tubelet_size)
         self.proj = nn.Conv3d(
             in_channels=in_chans,
             out_channels=embed_dim,
@@ -644,8 +644,8 @@ class PatchEmbed3D(nn.Module):
         )
 
     def forward(self, x, **kwargs):
+        if len(x.shape) < 5:
+            x = x[:, :, None, :, :]
         B, C, T, H, W = x.shape
-        print(x.shape)
         x = self.proj(x).flatten(2).transpose(1, 2) #NLC
-        print(x.shape)
         return x

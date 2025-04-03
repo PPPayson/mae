@@ -3,7 +3,7 @@ import argparse
 import timm
 import torch
 import src.util.misc as misc
-from src.models.models_encoder import LinearModel, FullModel
+from src.models.backbones.models_encoder import LinearModel, FullModel
 import numpy as np
 import random
 import wandb

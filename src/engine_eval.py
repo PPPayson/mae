@@ -14,7 +14,7 @@ from torchvision.transforms import functional as tvF
 from matplotlib import pyplot as plt
 from einops import rearrange
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from src.models.models_encoder import LinearModel, FullModel, LinearModelTimm
+from src.models.backbones.models_encoder import LinearModel, FullModel, LinearModelTimm
 from src.data.co3d_dataset import EmbeddingDataset
 from src.data.datasets import build_co3d_eval_loader
 from src.util.save_features import extract_features
@@ -22,7 +22,212 @@ from PIL import Image
 import src.util.clickme_utils as clickme_utils
 import src.util.misc as misc
 import src.util.metrics as metrics
+from src.models.backbones.models_decoder import DecoderViT, DecoderWrapper
+from functools import partial
 
+
+def train_latent_decoder(train_data_loader, encoder, decoder, loss_func, optimizer, device, epoch, start_steps, args, log_writer=None):
+    decoder.train()
+    metric_logger = misc.MetricLogger(delimiter='   ')
+    header = 'Latent Train Epoch: [{}]'.format(epoch)
+    print_freq = 10
+    n_frames = args.num_frames
+    mean = torch.as_tensor(args.mean).to(device)[None, :, None, None, None]
+    std = torch.as_tensor(args.std).to(device)[None, :, None, None, None]
+    patch_size = encoder.model.patch_size
+    for data_iter_step, batch in enumerate(metric_logger.log_every(train_data_loader, print_freq, header)):
+        it = start_steps + data_iter_step
+        videos = batch[0]
+        bool_masked_pos = batch[1]
+        org_videos = batch[-2]
+        window_size = int(math.sqrt(bool_masked_pos.shape[1]//args.num_frames))
+        mask = rearrange(bool_masked_pos, 'b (t h w) -> (b t) h w', h=window_size, t=args.num_frames).to(device, non_blocking=True).to(torch.bool)
+        bool_masked_pos = bool_masked_pos.to(device, non_blocking=True).to(torch.bool).flatten(1)
+        videos = videos.to(device, non_blocking=True)
+        org_videos = org_videos.to(device, non_blocking=True)
+        with torch.no_grad():
+            unnorm_videos = videos * std + mean
+            videos_patch = rearrange(unnorm_videos, 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=args.tubelet_size, p1=patch_size, p2=patch_size)
+            B, _, C = videos_patch.shape
+            if args.mask_type != 'none':
+                org_videos = org_videos * std + mean
+                gt_videos_patch = rearrange((org_videos), 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=args.tubelet_size, p1=patch_size, p2=patch_size)
+                # labels = gt_videos_patch[bool_masked_pos].reshape(B, -1, C)
+                labels = gt_videos_patch.reshape(B, -1, C)
+            else:
+                org_videos = org_videos * std + mean
+                gt_videos_patch = rearrange((org_videos), 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=args.tubelet_size, p1=patch_size, p2=patch_size)
+                labels = gt_videos_patch.reshape(B, -1, C)
+            videos = rearrange(videos, 'b c t h w -> (b t) c h w')
+            latent_output = encoder(videos, mask=mask, attn_mask=None, num_frames=args.num_frames, pool=False, f2d=False)
+            labels_long = (labels*15).to(torch.long)
+        latent_output = rearrange(latent_output, '(b t) n c -> b (t n) c', t=args.num_frames)
+        pred_frames = decoder(latent_output, return_token_num=0)
+        if args.mask_type == 'autoregressive':
+            pred_frames = rearrange(pred_frames, 'b (t n) (p c) -> b t c n p', c=16, t=n_frames-1)
+            pred_frames = pred_frames[:, 1:, :, :, :]
+            pred_frames = rearrange(pred_frames, 'b t c n p -> b c (t n) p', c=16, t=n_frames-2)
+        else:
+            pred_frames = rearrange(pred_frames, 'b (t n) (p c) -> b c t n p', c=16, t=n_frames)
+            pred_frames = pred_frames[:, :, :, 1:, :]
+            pred_frames = rearrange(pred_frames, 'b c t n p -> b c (t n) p')
+        loss = loss_func(input=pred_frames, target=labels_long)        
+        loss_value = loss.item()
+        metric_logger.update(loss=loss_value)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        metric_logger.synchronize_between_processes()
+        # if log_writer is not None:
+        #     log_writer.set_step(it)
+        #     if it%1000==0:
+        #         reconstruction=gt_videos_patch.clone()
+        #         pred_frames = torch.argmax(pred_frames, dim=1)/15.0
+        #         if args.mask_type == 'none':
+        #             reconstruction[~bool_masked_pos] = pred_frames.view(B*pred_frames.shape[1], -1).float()
+        #         else:
+        #             pred_frames = pred_frames[bool_masked_pos]
+        #             reconstruction[bool_masked_pos] = pred_frames.float()
+        #         reconstruction = rearrange(reconstruction, 'b n (p c) -> b n p c', c=3)
+        #         videos_patch = rearrange(unnorm_videos[0:1], 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=args.tubelet_size, p1=patch_size, p2=patch_size)
+        #         videos_patch_to_mask = copy.deepcopy(videos_patch)
+        #         videos_patch_to_mask[bool_masked_pos[0:1]] = 0
+        #         masked_inp = rearrange(videos_patch_to_mask, 'b (t h w) (p0 p1 p2 c) -> b (t p0) c (h p1) (w p2)', p0=args.tubelet_size, p1=patch_size, p2=patch_size, w=14, h=14, t=int(n_frames/args.tubelet_size))
+        #         reconstruction = rearrange(reconstruction, 'b (t h w) (p0 p1 p2) c -> b (t p0) c (h p1) (w p2)', p0=args.tubelet_size, p1=patch_size, p2=patch_size, w=14, h=14, t=int(n_frames/args.tubelet_size))
+        #         unnorm_videos = (unnorm_videos*15).to(torch.long)/15.
+        #         log_writer.update(latent_train_frames=[unnorm_videos[0].transpose(0, 1), reconstruction[0], masked_inp[0]], head="latent_train")
+        #     if it%40==0:
+        #         log_writer.update(loss=metric_logger.loss.value, head="latent_train")
+        #         log_writer.update(epoch=epoch, head="latent_train", commit=True)
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+def eval_latent_decoder(val_data_loader, encoder, decoder, loss_func, device, epoch, start_steps, args, log_writer=None):
+    metric_logger = misc.MetricLogger(delimiter='   ')
+    header = 'Latent Eval Epoch: [{}]'.format(epoch)
+    print_freq = 10
+    mean = torch.as_tensor(args.mean).to(device)[None, :, None, None, None]
+    std = torch.as_tensor(args.std).to(device)[None, :, None, None, None]
+    n_frames = args.num_frames
+    patch_size = encoder.model.patch_size
+    decoder.eval()
+    for data_iter_step, batch in enumerate(metric_logger.log_every(val_data_loader, print_freq, header)):
+        with torch.no_grad():
+            videos, bool_masked_pos = batch[0], batch[1]
+            org_videos = batch[-2]
+            window_size = int(math.sqrt(bool_masked_pos.shape[1]//args.num_frames))
+            mask = rearrange(bool_masked_pos, 'b (t h w) -> (b t) h w', h=window_size, t=args.num_frames).to(device, non_blocking=True).to(torch.bool)
+            bool_masked_pos = bool_masked_pos.to(device, non_blocking=True).to(torch.bool).flatten(1)
+            videos = videos.to(device, non_blocking=True)
+            org_videos = org_videos.to(device, non_blocking=True)
+            unnorm_videos = videos * std + mean
+            videos_patch = rearrange(unnorm_videos, 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=args.tubelet_size, p1=patch_size, p2=patch_size)
+            B, _, C = videos_patch.shape
+            if args.mask_type != 'none':
+                gt_videos_patch = rearrange((org_videos * std + mean), 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=args.tubelet_size, p1=patch_size, p2=patch_size)
+                # labels = gt_videos_patch[bool_masked_pos].reshape(B, -1, C)
+                labels = gt_videos_patch.reshape(B, -1, C)
+            else:
+                gt_videos_patch = rearrange((org_videos * std + mean), 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=args.tubelet_size, p1=patch_size, p2=patch_size)
+                labels = gt_videos_patch.reshape(B, -1, C)            
+            videos = rearrange(videos, 'b c t h w -> (b t) c h w')
+            latent_output = encoder(videos, mask=mask, attn_mask=None, num_frames=args.num_frames, pool=False, f2d=False)
+            labels_long = (labels*15).to(torch.long)
+            latent_output = rearrange(latent_output, '(b t) n c -> b (t n) c', t=args.num_frames)
+            pred_frames = decoder(latent_output, return_token_num=0)
+            if args.mask_type == 'autoregressive':
+                pred_frames = rearrange(pred_frames, 'b (t n) (p c) -> b t c n p', c=16, t=n_frames-1)
+                pred_frames = pred_frames[:, 1:, :, 1:, :]
+                pred_frames = rearrange(pred_frames, 'b t c n p -> b c (t n) p', c=16, t=n_frames-2)
+            else:
+                pred_frames = rearrange(pred_frames, 'b (t n) (p c) -> b c t n p', c=16, t=n_frames)
+                pred_frames = pred_frames[:, :, :, 1:, :]
+                pred_frames = rearrange(pred_frames, 'b c t n p -> b c (t n) p')
+            loss = loss_func(input=pred_frames, target=labels_long)        
+            loss_value = loss.item()
+            metric_logger.update(loss=loss_value)
+            metric_logger.synchronize_between_processes()
+
+    # if log_writer is not None:
+        # log_writer.set_step(start_steps)
+        # log_writer.update(loss=metric_logger.loss.global_avg, head="latent_eval")
+        # log_writer.update(epoch=epoch, head="latent_eval")
+    # reconstruction = videos_patch.clone()
+    reconstruction = torch.zeros(videos_patch.shape).to(device)
+    pred_frames = torch.argmax(pred_frames, dim=1)/15.0
+    if args.mask_type != 'none':
+        pred_frames = pred_frames[bool_masked_pos]
+        reconstruction[bool_masked_pos] = pred_frames.float()
+    else:
+        reconstruction[~bool_masked_pos] = pred_frames.view(B*pred_frames.shape[1], -1).float()
+
+    reconstruction = rearrange(reconstruction, 'b n (p c) -> b n p c', c=3)
+    videos_patch = rearrange(unnorm_videos[0:1], 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=args.tubelet_size, p1=patch_size, p2=patch_size)
+    videos_patch_to_mask = copy.deepcopy(videos_patch)
+    videos_patch_to_mask[bool_masked_pos[0:1]] = 0
+    masked_inp = rearrange(videos_patch_to_mask, 'b (t h w) (p0 p1 p2 c) -> b (t p0) c (h p1) (w p2)', p0=args.tubelet_size, p1=patch_size, p2=patch_size, w=14, h=14, t=int(n_frames/args.tubelet_size))
+    reconstruction = rearrange(reconstruction, 'b (t h w) (p0 p1 p2) c -> b (t p0) c (h p1) (w p2)', p0=args.tubelet_size, p1=patch_size, p2=patch_size, w=14, h=14, t=int(n_frames/args.tubelet_size))
+    unnorm_videos = (unnorm_videos*15).to(torch.long)/15.
+        # log_writer.update(latent_val_frames=[unnorm_videos[0].transpose(0, 1), reconstruction[0], masked_inp[0]], head="latent_eval")
+    # print("Averaged stats:", metric_logger)
+    # return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    frames = [unnorm_videos[0].transpose(0, 1), reconstruction[0], masked_inp[0]]
+    return frames
+
+def eval_latent_reconstruct(
+    model: torch.nn.Module,
+    train_data_loader: Iterable,
+    val_data_loader: Iterable,
+    device: torch.device,
+    epoch: int,
+    num_epochs: int,
+    learning_rate=5e-4,
+    log_writer=None,
+    start_steps=None,
+    args=None,
+    timm_model=False
+):
+    model.eval()
+    if hasattr(model, 'encoder'):
+        encoder = model.encoder
+        timm_model = False
+    elif hasattr(model, 'teacher'):
+        encoder = model.student_encoder
+        # encoder = model.student_encoder
+        timm_model = False
+    else:
+        encoder = model
+    
+    for param in encoder.parameters():
+        param.requires_grad = False
+
+    encoder_dim = encoder.model.embed_dim
+    decoder_model = DecoderViT(
+        num_classes=768*16,
+        embed_dim=512,
+        depth=8,
+        num_heads=16,
+        mlp_ratio=4,
+        camera_params_enabled=False,
+        drop_path_rate=0,
+        attn_drop_rate=0,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),
+        num_frames=args.num_frames
+    )
+
+    encoder_to_decoder = nn.Linear(encoder_dim, 512, bias=False)
+    latent_decoder = DecoderWrapper(encoder_to_decoder, decoder_model)
+
+    optimizer = torch.optim.AdamW(latent_decoder.parameters(), lr=learning_rate, weight_decay=1e-4)
+
+    loss_func = nn.CrossEntropyLoss()
+    latent_decoder = latent_decoder.to(device)
+    for epoch in range(num_epochs):
+        train_latent_decoder(train_data_loader, encoder, latent_decoder, loss_func, optimizer, device, epoch, start_steps, args, log_writer)
+    frames = eval_latent_decoder(val_data_loader, encoder, latent_decoder, loss_func, device, epoch, start_steps, args, log_writer)
+    if log_writer is not None:
+        log_writer.update(latent_val_frames=frames, head="latent_eval")
+    for param in encoder.parameters():
+        param.requires_grad = True
 
 def dino_eval_one_epoch(model: torch.nn.Module, 
                         model_without_ddp: torch.nn.Module,
@@ -47,14 +252,34 @@ def dino_eval_one_epoch(model: torch.nn.Module,
     for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         with torch.no_grad():
             videos = batch[0]
+            bool_masked_pos = batch[1]
+            org_videos = batch[-2]
+            # org_videos = rearrange(org_videos, 'b t c h w -> b c t h w')
             true_camera_params = None
+            if isinstance(bool_masked_pos, list):
+                for i, m in enumerate(bool_masked_pos):
+                    window_size = int(math.sqrt(m.shape[1]//args.num_frames))
+                    m = rearrange(m, 'b (t h w) -> (b t) h w', t=args.num_frames, h=window_size, w=window_size)
+                    bool_masked_pos[i] = m.to(device, non_blocking=True).to(torch.bool)
+                # bool_masked_pos = [m.to(device, non_blocking=True) for m in bool_masked_pos]
+            else:
+                window_size = int(math.sqrt(bool_masked_pos.shape[1]//args.num_frames))
+                bool_masked_pos = rearrange(bool_masked_pos, 'b (t h w) -> (b t) h w', h=window_size, t=args.num_frames)
+                bool_masked_pos = bool_masked_pos.to(device, non_blocking=True).to(torch.bool)
             if camera_params_enabled:
                 true_camera_params = batch[2].to(device, non_blocking=True)
                 camera_param_cats = batch[3].to(device, non_blocking=True)
-            videos = videos.to(device, non_blocking=True)
+            if isinstance(videos, list):
+                videos = [v.to(device, non_blocking=True) for v in videos]
+            else:
+                videos = videos.to(device, non_blocking=True)
             with torch.cuda.amp.autocast(enabled=True):
-                outputs = model(videos)
-                loss = model_without_ddp.calculate_loss(outputs['student_output'], outputs['teacher_output'], epoch)
+                if 'ibot' in args.model or 'latent_mae' in args.model:
+                    outputs = model(videos, org_videos, bool_masked_pos)
+                    loss = model_without_ddp.calculate_loss(outputs['student_output'], outputs['teacher_output'], bool_masked_pos, epoch)
+                else:
+                    outputs = model(videos, org_videos)
+                    loss = model_without_ddp.calculate_loss(outputs['student_output'], outputs['teacher_output'], epoch)
                 loss_value = loss.item()
         metric_logger.update(loss=loss_value)
         metric_logger.synchronize_between_processes()
@@ -109,9 +334,12 @@ def autoreg_eval_one_epoch(model: torch.nn.Module,
             videos = videos.to(device, non_blocking=True)
             bool_masked_pos = bool_masked_pos.to(device, non_blocking=True).flatten(1).to(torch.bool)
             unnorm_videos = videos * std + mean  # in [0, 1]
-            videos_patch = rearrange(unnorm_videos, 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=1, p1=patch_size, p2=patch_size)
+            videos_patch = rearrange(unnorm_videos, 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=args.tubelet_size, p1=patch_size, p2=patch_size)
             B, _, C = videos_patch.shape
-            labels = videos_patch[bool_masked_pos].reshape(B, -1, C)
+            if args.mask_type != 'none':
+                labels = videos_patch[bool_masked_pos].reshape(B, -1, C)
+            else:
+                labels = videos_patch.reshape(B, -1, C)
             with torch.cuda.amp.autocast(enabled=True):
                 outputs = model(videos, camera=true_camera_params, mask=bool_masked_pos)
                 pred_frames = outputs['pred_frames']
@@ -173,13 +401,17 @@ def autoreg_eval_one_epoch(model: torch.nn.Module,
         reconstruction = videos_patch.clone()
         if use_cce:
             pred_frames = torch.argmax(pred_frames, dim=1)/15.0
-        reconstruction[bool_masked_pos] = pred_frames.view(B*pred_frames.shape[1], -1).float()
+        if args.mask_type != 'none':
+            reconstruction[bool_masked_pos] = pred_frames.view(B*pred_frames.shape[1], -1).float()
+        else:
+            reconstruction[~bool_masked_pos] = pred_frames.view(B*pred_frames.shape[1], -1).float()
+
         reconstruction = rearrange(reconstruction, 'b n (p c) -> b n p c', c=3)
-        videos_patch = rearrange(unnorm_videos[0:1], 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=1, p1=patch_size, p2=patch_size)
+        videos_patch = rearrange(unnorm_videos[0:1], 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=args.tubelet_size, p1=patch_size, p2=patch_size)
         videos_patch_to_mask = copy.deepcopy(videos_patch)
         videos_patch_to_mask[bool_masked_pos[0:1]] = 0
-        masked_inp = rearrange(videos_patch_to_mask, 'b (t h w) (p0 p1 p2 c) -> b (t p0) c (h p1) (w p2)', p0=1, p1=patch_size, p2=patch_size, w=14, h=14, t=n_frames)
-        reconstruction = rearrange(reconstruction, 'b (t h w) (p0 p1 p2) c -> b (t p0) c (h p1) (w p2)', p0=1, p1=patch_size, p2=patch_size, w=14, h=14, t=n_frames)
+        masked_inp = rearrange(videos_patch_to_mask, 'b (t h w) (p0 p1 p2 c) -> b (t p0) c (h p1) (w p2)', p0=args.tubelet_size, p1=patch_size, p2=patch_size, w=14, h=14, t=int(n_frames/args.tubelet_size))
+        reconstruction = rearrange(reconstruction, 'b (t h w) (p0 p1 p2) c -> b (t p0) c (h p1) (w p2)', p0=args.tubelet_size, p1=patch_size, p2=patch_size, w=14, h=14, t=int(n_frames/args.tubelet_size))
         if use_cce:
             unnorm_videos = (unnorm_videos*15).to(torch.long)/15.
         log_writer.update(valframes=[unnorm_videos[0].transpose(0, 1), reconstruction[0], masked_inp[0]], head="val")
@@ -409,6 +641,7 @@ def eval_co3d(model: torch.nn.Module,
             timm_model = False
         elif hasattr(model, 'teacher'):
             encoder = model.teacher_encoder
+            # encoder = model.student_encoder
             timm_model = False
         elif type(model).__name__ == 'MaskedAutoencoderViT':
             timm_model=False
@@ -506,9 +739,13 @@ def eval_co3d(model: torch.nn.Module,
     if eval_align:
         avg_test_acc, alignment_scores, null_scores = eval_alignment(full_model, test_data_loader, device, log_writer, list(range(10)), args, dataset='co3d', save_img=save_img)
         imgnet_acc, imgnet_align, imgnet_null = eval_alignment(full_model, imgnet_loader, device, log_writer, list(range(10)), args, dataset='imgnet', save_img=save_img)
-        print(f"Accuracy: {best_acc} Co3D Alignment: {np.mean(alignment_scores['full_spearman'])} ImgNet Alignment: {np.mean(imgnet_align['full_spearman'])}")
+        print(f"Val Accuracy: {best_acc} ImgNet Test Accuracy: {imgnet_acc}")
+        print(f"Co3D Alignment: {np.mean(alignment_scores['full_spearman'])} ImgNet Alignment: {np.mean(imgnet_align['full_spearman'])}")
         print(f"Co3D Unnorm: {np.mean(alignment_scores['unnorm_spearman'])} ImgNet Unnorm: {np.mean(imgnet_align['unnorm_spearman'])}")
+        print(f"Co3D Null: {np.mean(null_scores['unnorm_spearman'])} ImgNet Null: {np.mean(imgnet_null['unnorm_spearman'])}")
         print(f"Co3D Topk: {np.mean(alignment_scores['topk_spearman'])} ImgNet TopK: {np.mean(imgnet_align['topk_spearman'])}")
+        print(f"Co3D Topk Unnorm: {np.mean(alignment_scores['unnorm_topk'])} ImgNet Topk Unnorm: {np.mean(imgnet_align['unnorm_topk'])}")
+        print(f"Co3D Topk Null: {np.mean(null_scores['unnorm_topk'])} ImgNet Topk Null: {np.mean(imgnet_null['unnorm_topk'])}")
         if log_writer is not None:
             log_writer.update(test_acc=avg_test_acc, head='co3d_eval')
             log_writer.update(full_spearman=np.mean(alignment_scores['full_spearman']), head='co3d_eval')

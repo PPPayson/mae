@@ -25,12 +25,13 @@ from src.util.optim_factory import create_optimizer
 import src.util.misc as misc
 from src.util.misc import NativeScalerWithGradNormCount as NativeScaler
 from src.util.dino import cosine_scheduler, has_batchnorms
-from src.models import models_dino
-from src.models.models_encoder import LinearModel
+from src.models.methods import models_dino, models_ibot, models_latent_mae
+from src.models.backbones.models_encoder import LinearModel
 from src.engine_pretrain import dino_train_one_epoch
-from src.engine_eval import eval_alignment, eval_co3d, dino_eval_one_epoch
-from src.data.datasets import build_co3d_eval_loader, build_pretraining_dataset
+from src.engine_eval import eval_alignment, eval_co3d, dino_eval_one_epoch, eval_latent_reconstruct
+from src.data.datasets import build_co3d_eval_loader, build_pretraining_dataset, DataAugmentationDINO
 from src.util.save_features import load_logits
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Autoregressive Vision Model pre-training script', add_help=False)
@@ -49,14 +50,14 @@ def get_args_parser():
     parser.add_argument('--model', default='pretrain_videomae_small_patch16_224', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--timm_pool', default=False, action='store_true')
-    parser.add_argument('--pos_embed', type=str, default='1d_spatial', choices=['1d_spatial', '1d_temporal', '2d', '3d', 'rel_3d'])
+    parser.add_argument('--pos_embed', type=str, default='1d_spatial', choices=['1d_spatial', '1d_temporal', '2d', '3d', 'rel_3d', 'learned_3d'])
     parser.add_argument('--decoder_cls', default=False, action='store_true', help='Use cls token in the decoder')
-    parser.add_argument('--mask_type', default='tube', choices=['random', 'tube', 'causal', 'causal_interpol', 'autoregressive'],
+    parser.add_argument('--mask_type', default='tube', choices=['random', 'tube', 'causal', 'causal_interpol', 'autoregressive', 'block'],
                         type=str, help='masked strategy of video tokens/patches')
 
-    parser.add_argument('--mask_ratio', default=0.75, type=float,
+    parser.add_argument('--mask_ratio', default=0.75, type=float, nargs='+',
                         help='ratio of the visual tokens/patches need be masked')
-
+    parser.add_argument('--mask_ratio_var', default=0, type=float, nargs='+')
     parser.add_argument('--input_size', default=224, type=int,
                         help='videos input size for backbone')
 
@@ -108,7 +109,8 @@ def get_args_parser():
                         help='Color jitter factor (default: 0.4)')
     parser.add_argument('--train_interpolation', type=str, default='bicubic',
                         help='Training interpolation (random, bilinear, bicubic default: "bicubic")')
-
+    parser.add_argument('--shared_transform', default=False, action='store_true')
+    parser.add_argument('--photo_trasnform', default=False, action='store_true')
     # Dataset parameters
     parser.add_argument('--dataset', default='co3d', type=str, choices=['co3d', 'mvimgnet', 'co3d_mvimgnet', 'imgnet'])
     parser.add_argument('--data_root', required=True, type=str, help='dataset root directory')
@@ -119,9 +121,16 @@ def get_args_parser():
     parser.add_argument('--features_path', default='./features', type=str, help='path to saved encoder features')
     parser.add_argument('--stats_json', default='./assets/click_stats.json', type=str)
     parser.add_argument('--clickmaps_path', default='./assets/co3d_val_processed.npz', type=str)
+    parser.add_argument('--tubelet_size', default=1, type=int)
+
+    # parser.add_argument('--clickmaps_path', default='./assets/co3d_val/', type=str)
+    # parser.add_argument('--clickmaps_img_path', default='/cifs/data/tserre_lrs/projects/projects/prj_video_imagenet/CO3D_ClickMe2')
     parser.add_argument('--alignments_json', default='./assets/alignments.json', type=str)
     parser.add_argument('--clickmaps_human_path', default='./assets/human_ceiling_split_half_co3d_val.npz', type=str)
     parser.add_argument('--imgnet_clickmaps_path', default='./assets/jay_imagenet_for_co3d_val_0.1_processed.npz', type=str)
+
+    # parser.add_argument('--imgnet_clickmaps_path', default='./assets/jay_imagenet_for_co3d_val_0.1', type=str)
+    # parser.add_argument('--imgnet_clickmaps_img_path', default='/cifs/data/tserre_lrs/projects/projects/prj_video_imagenet/imagenet/ILSVRC/Data/CLS-LOC/val2', type=str)
     parser.add_argument('--imgnet_clickmaps_human_path', default='./assets/human_ceiling_split_half_jay_imagenet_for_co3d_val_0.1.npz', type=str)
     parser.add_argument('--imgnet2co3d_label', default='./assets/synset_to_co3d.npy', type=str)
 
@@ -133,6 +142,7 @@ def get_args_parser():
     parser.add_argument('--imagenet_default_mean_and_std', default=True, action='store_true')
     parser.add_argument('--num_frames', type=int, default= 4)
     parser.add_argument('--sampling_rate', type=int, default= 4)
+    parser.add_argument('--single_video', default=False, action='store_true')
     parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default=None,
@@ -178,9 +188,16 @@ def get_args_parser():
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float,
         help="""Initial value for the teacher temperature: 0.04 works well in most cases.
         Try decreasing it if the training loss does not decrease.""")
+    parser.add_argument('--warmup_teacher_patch_temp', default=0.04, type=float,
+        help="""Initial value for the teacher temperature: 0.04 works well in most cases.
+        Try decreasing it if the training loss does not decrease.""")        
+    parser.add_argument('--teacher_patch_temp', default=0.04, type=float, help="""Final value (after linear warmup)
+        of the teacher temperature. For most experiments, anything above 0.07 is unstable. We recommend
+        starting with the default value of 0.04 and increase this slightly if needed.""")
     parser.add_argument('--teacher_temp', default=0.04, type=float, help="""Final value (after linear warmup)
         of the teacher temperature. For most experiments, anything above 0.07 is unstable. We recommend
         starting with the default value of 0.04 and increase this slightly if needed.""")
+
     parser.add_argument('--warmup_teacher_temp_epochs', default=15, type=int,
         help='Number of warmup epochs for the teacher temperature (Default: 30).')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
@@ -188,9 +205,17 @@ def get_args_parser():
         the first epoch helps training. Try increasing this value if the loss does not decrease.""")
     parser.add_argument('--out_dim', default=65536, type=int, help="""Dimensionality of
         the DINO head output. For complex and large datasets large values (like 65k) work well.""")
+    parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.4, 1.))
+    parser.add_argument('--local_crops_number', type=int, default=8)
+    parser.add_argument('--global_crops_number', type=int, default=8)
+    parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.05, 0.4))
+    parser.add_argument('--multi_crop', default=False, action='store_true')
+    
     return parser
 
 def get_model(args):
+    models_dino.__dict__.update(models_ibot.__dict__)
+    models_dino.__dict__.update(models_latent_mae.__dict__)
     model = models_dino.__dict__[args.model](
         pretrained=not args.not_pretrained,
         drop_path_rate=args.drop_path,
@@ -203,13 +228,16 @@ def get_model(args):
         num_frames = args.num_frames,
         timm_pool = args.timm_pool,
         warmup_teacher_temp=args.warmup_teacher_temp,
+        warmup_teacher_patch_temp=args.warmup_teacher_patch_temp,
         teacher_temp=args.teacher_temp,
+        teacher_patch_temp=args.teacher_patch_temp,
         warmup_teacher_temp_epochs=args.warmup_teacher_temp_epochs,
         out_dim=args.out_dim,
         epochs=args.epochs,
-        pos_embed=args.pos_embed      
+        pos_embed=args.pos_embed,
+        global_ncrops = args.global_crops_number,
+        local_ncrops=args.local_crops_number 
     )
-
     return model
 
 
@@ -230,7 +258,6 @@ def main(args):
         args.decoder_num_classes = 768*16
     else:
         args.decoder_num_classes = 768
-
     model = get_model(args)
     args.mean = model.mean
     args.std = model.std
@@ -241,8 +268,12 @@ def main(args):
     args.window_size = (args.num_frames, args.input_size // patch_size, args.input_size // patch_size)
     args.patch_size = patch_size
     
-    dataset_train = build_pretraining_dataset(args)
-    dataset_val = build_pretraining_dataset(args, is_train=False)
+    if args.multi_crop:
+        dino_transforms = DataAugmentationDINO(args.global_crops_scale, args.local_crops_scale, args.global_crops_number, args.local_crops_number, args)
+    else:
+        dino_transforms = None
+    dataset_train = build_pretraining_dataset(args, transform=dino_transforms)
+    dataset_val = build_pretraining_dataset(args, is_train=False, transform=dino_transforms)
 
     # data_config = timm.data.resolve_model_data_config(model.student_encoder.model)
     # transform = misc.get_transform_center_crop(data_config)
@@ -258,7 +289,7 @@ def main(args):
         )
         print("Sampler_train = %s" % str(sampler_train))
         sampler_val = torch.utils.data.DistributedSampler(
-            dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=True, seed=seed
+            dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False, seed=seed
         )
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
@@ -294,7 +325,9 @@ def main(args):
     # define the model
     model.to(device)
     model_without_ddp = model
-    print("Model = %s" % str(model_without_ddp))
+    # print("Model = %s" % str(model_without_ddp))
+    # for idx, (name, param) in enumerate(model_without_ddp.named_parameters()):
+    #     print(f"Index: {idx}, Name: {name}, Shape: {param.shape}")
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params: {} M'.format(n_parameters / 1e6))
 
@@ -341,11 +374,15 @@ def main(args):
     start_time = time.time()
     best_acc = 0
     best_epoch = 0
-    # eval_outputs = eval_co3d(model_without_ddp, co3d_train_dataloader,
-    #             co3d_val_dataloader, co3d_test_dataloader, 
-    #             imgnet_test_dataloader, device, -1, num_epochs=args.eval_co3d_epochs, 
-    #             batch_size=args.batch_size, learning_rate=5e-4, log_writer=log_writer,
-    #             num_workers=args.num_workers, args=args, eval_align=True)
+    eval_outputs = eval_co3d(model_without_ddp, co3d_train_dataloader,
+                co3d_val_dataloader, co3d_test_dataloader, 
+                imgnet_test_dataloader, device, -1, num_epochs=args.eval_co3d_epochs, 
+                batch_size=args.eval_co3d_batch_size, learning_rate=5e-4, log_writer=log_writer,
+                num_workers=args.num_workers, args=args, eval_align=True)
+    eval_latent_reconstruct(model_without_ddp,
+                data_loader_train, data_loader_val, device, -1, num_epochs=1,
+                learning_rate=5e-4, log_writer=log_writer, start_steps=0, args=args)
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
@@ -376,8 +413,11 @@ def main(args):
         eval_outputs = eval_co3d(model_without_ddp, co3d_train_dataloader,
                     co3d_val_dataloader, co3d_test_dataloader, 
                     imgnet_test_dataloader, device, epoch, num_epochs=args.eval_co3d_epochs, 
-                    batch_size=args.batch_size, learning_rate=5e-4, log_writer=log_writer,
-                    num_workers=args.num_workers, args=args, eval_align=True)
+                    batch_size=args.eval_co3d_batch_size, learning_rate=5e-4, log_writer=log_writer,
+                        num_workers=args.num_workers, args=args, eval_align=True)
+        eval_latent_reconstruct(model_without_ddp,
+                    data_loader_train, data_loader_val, device, -1, num_epochs=1,
+                    learning_rate=5e-4, log_writer=log_writer, start_steps=0, args=args)
         acc = eval_outputs['acc']
 
         if acc > best_acc:

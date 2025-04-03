@@ -16,6 +16,7 @@ from main_pretrain_autoreg import get_args_parser as model_get_args_parser
 from src.engine_eval import eval_alignment, eval_co3d
 from src.data.datasets import build_co3d_eval_loader, build_pretraining_dataset
 from src.util.pos_embed import interpolate_pos_embed
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 def get_model(args):
     if 'dino' in args.model:

@@ -1,5 +1,5 @@
 module load libjpeg-turbo
-OUTPUT_DIR='outs/video_mae/videomae_beit_large_patch16_tube_0219'
+OUTPUT_DIR='outs/video_mae/videomae_beit_large_patch16_random_0310'
 export HUGGINGFACE_HUB_CACHE=./pretrained_ckpts
 
 DATA_PATH='data_lists/co3d_train.txt'
@@ -11,15 +11,15 @@ NCCL_DEBUG=INFO OMP_NUM_THREADS=1  python3 -m torch.distributed.run \
      --standalone \
      --nnodes=1 \
      --nproc_per_node=2 \
-      main_pretrain_videomae.py \
+        main_pretrain_videomae.py \
         --num_workers 16 \
         --data_root ${DATA_ROOT} \
         --data_path ${DATA_PATH} \
         --data_val_path ${DATA_VAL_PATH} \
-        --mask_type tube \
-        --mask_ratio 0.9 \
+        --mask_type random \
+        --mask_ratio 0.75 \
         --model videomae_beit_large_patch16 \
-        --batch_size 64 \
+        --batch_size 8 \
         --lr 0.0005 \
         --no-binocular \
         --num_frames 8 \
@@ -46,7 +46,7 @@ NCCL_DEBUG=INFO OMP_NUM_THREADS=1  python3 -m torch.distributed.run \
         --categorical_camera \
         --feature_loss \
         --decoder_pos_embed 1d_spatial \
-        --no-normalize_target           
+        --no-normalize_target 
         #--clip_grad 1 \
         # --decoder_cls \
         # --use_cls \

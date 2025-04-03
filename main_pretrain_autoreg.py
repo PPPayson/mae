@@ -24,8 +24,8 @@ import torchvision.datasets as datasets
 from src.util.optim_factory import create_optimizer
 import src.util.misc as misc
 from src.util.misc import NativeScalerWithGradNormCount as NativeScaler
-from src.models import models_autoreg
-from src.models.models_encoder import LinearModel
+from src.models.methods import models_autoreg
+from src.models.backbones.models_encoder import LinearModel
 from src.engine_pretrain import autoreg_train_one_epoch
 from src.engine_eval import eval_alignment, eval_co3d, autoreg_eval_one_epoch
 from src.data.datasets import build_co3d_eval_loader, build_pretraining_dataset
@@ -48,16 +48,18 @@ def get_args_parser():
     parser.add_argument('--model', default='pretrain_videomae_small_patch16_224', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--timm_pool', default=False, action='store_true')
-    parser.add_argument('--decoder_pos_embed', type=str, default='1d_spatial', choices=['1d_spatial', '1d_temporal', '2d', '3d'])
+    parser.add_argument('--decoder_pos_embed', type=str, default='1d_spatial', choices=['1d_spatial', '1d_temporal', '2d', '3d', 'learned_3d'])
     parser.add_argument('--decoder_cls', default=False, action='store_true', help='Use cls token in the decoder')
     parser.add_argument('--mask_type', default='tube', choices=['random', 'tube', 'causal', 'causal_interpol', 'autoregressive'],
                         type=str, help='masked strategy of video tokens/patches')
 
     parser.add_argument('--mask_ratio', default=0.75, type=float,
                         help='ratio of the visual tokens/patches need be masked')
+    parser.add_argument('--mask_ratio_var', default=0, type=float, nargs='+')
 
     parser.add_argument('--input_size', default=224, type=int,
                         help='videos input size for backbone')
+    parser.add_argument('--single_video', default=False, action='store_true')
 
     parser.add_argument('--drop_path', type=float, default=0.0, metavar='PCT',
                         help='Drop path rate (default: 0.1)')
@@ -65,6 +67,7 @@ def get_args_parser():
     parser.add_argument('--normalize_target', default=True, type=bool, help='normalized the target patch pixels')
     parser.add_argument('--no-normalize_target', dest='normalize_target', action='store_false')
     parser.add_argument('--decoder_camera_dropout', type=float, default=0.0, help='dropout rate for the camera pose decoder')
+    parser.add_argument('--tubelet_size', default=1, type=int)
 
     # Reverse the traversal order
     parser.add_argument('--reverse_sequence', default=True, type=bool, help='Reverse the sequence of frame traversal')
@@ -107,6 +110,8 @@ def get_args_parser():
                         help='Color jitter factor (default: 0.4)')
     parser.add_argument('--train_interpolation', type=str, default='bicubic',
                         help='Training interpolation (random, bilinear, bicubic default: "bicubic")')
+    parser.add_argument('--shared_transform', default=False, action='store_true')
+    parser.add_argument('--photo_trasnform', default=False, action='store_true')
 
     # Dataset parameters
     parser.add_argument('--dataset', default='co3d', type=str, choices=['co3d', 'mvimgnet', 'co3d_mvimgnet', 'imgnet', 'co3d_video'])
@@ -342,33 +347,15 @@ def main(args):
     start_time = time.time()
     best_acc = 0
     best_epoch = 0
-    acc = eval_co3d(model_without_ddp, co3d_train_dataloader,
-                co3d_val_dataloader, co3d_test_dataloader, 
-                imgnet_test_dataloader, device, -1, num_epochs=args.eval_co3d_epochs, 
-                batch_size=args.batch_size, learning_rate=5e-4, log_writer=log_writer,
-                num_workers=args.num_workers, args=args, eval_align=True)
+    # acc = eval_co3d(model_without_ddp, co3d_train_dataloader,
+    #             co3d_val_dataloader, co3d_test_dataloader, 
+    #             imgnet_test_dataloader, device, -1, num_epochs=args.eval_co3d_epochs, 
+    #             batch_size=args.batch_size, learning_rate=5e-4, log_writer=log_writer,
+    #             num_workers=args.num_workers, args=args, eval_align=True)
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
-            data_loader_val.sampler.set_epoch(epoch)
-
-        # if epoch == 10:
-        #     for p in model_without_ddp.encoder.parameters():
-        #         p.requires_grad=True
-            # if args.distributed:
-            #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=False)
-            #     model_without_ddp = model.module
-        # if linear_model is not None:
-        #     model_opt = (model, linear_model)
-        # else:
-        #     model_opt = model
-        # if args.schedule_free:
-        #     args.opt = 'adamWScheduleFree'
-        #     if args.warmup_epochs > 0 and args.warmup_steps <= 0:
-        #         args.warmup_steps = args.warmup_epochs * num_training_steps_per_epoch
-        #     optimizer = create_optimizer(args, model_opt, filter_bias_and_bn=False)
-        # else:
-        #     optimizer = create_optimizer(args, model_opt)                    
+            data_loader_val.sampler.set_epoch(epoch)             
 
         train_stats = autoreg_train_one_epoch(
             model, data_loader_train,
@@ -385,7 +372,6 @@ def main(args):
             n_frames=args.num_frames,
             schedule_free=args.schedule_free,
             linear_model=linear_model,
-            linear_optimizer=linear_optimizer,
             feature_loss=args.feature_loss,
             log_writer=log_writer,
             camera_params_enabled=args.camera_params,

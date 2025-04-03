@@ -24,8 +24,8 @@ import torchvision.datasets as datasets
 from src.util.optim_factory import create_optimizer
 import src.util.misc as misc
 from src.util.misc import NativeScalerWithGradNormCount as NativeScaler
-from src.models import models_videomae
-from src.models.models_encoder import LinearModel
+from src.models.methods import models_videomae
+from src.models.backbones.models_encoder import LinearModel
 from src.engine_pretrain import autoreg_train_one_epoch
 from src.engine_eval import eval_alignment, eval_co3d, autoreg_eval_one_epoch
 from src.data.datasets import build_co3d_eval_loader, build_pretraining_dataset
@@ -48,9 +48,9 @@ def get_args_parser():
     parser.add_argument('--model', default='pretrain_videomae_small_patch16_224', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--timm_pool', default=False, action='store_true')
-    parser.add_argument('--decoder_pos_embed', type=str, default='1d_spatial', choices=['1d_spatial', '1d_temporal', '2d', '3d'])
+    parser.add_argument('--decoder_pos_embed', type=str, default='1d_spatial', choices=['1d_spatial', '1d_temporal', '2d', '3d', 'learned_3d'])
     parser.add_argument('--decoder_cls', default=False, action='store_true', help='Use cls token in the decoder')
-    parser.add_argument('--mask_type', default='tube', choices=['random', 'tube', 'causal', 'causal_interpol', 'autoregressive'],
+    parser.add_argument('--mask_type', default='tube', choices=['block', 'random', 'tube', 'causal', 'causal_interpol', 'autoregressive', 'none'],
                         type=str, help='masked strategy of video tokens/patches')
 
     parser.add_argument('--mask_ratio', default=0.75, type=float,
@@ -68,6 +68,7 @@ def get_args_parser():
     # Reverse the traversal order
     parser.add_argument('--reverse_sequence', default=True, type=bool, help='Reverse the sequence of frame traversal')
     parser.add_argument('--no-reverse_sequence', dest='reverse_sequence', action='store_false')
+    parser.add_argument('--photo_trasnform', default=False, action='store_true')
 
     # Optimizer parameters
     parser.add_argument('--opt', default='adamw', type=str, metavar='OPTIMIZER',
@@ -170,6 +171,9 @@ def get_args_parser():
     parser.add_argument('--camera_param_dim', type=int, default=7)
     parser.add_argument('--camera_params', action='store_true', default=False, help='Train with Camera Parameters in the Decoder')
     parser.add_argument('--no_wandb', default=False, action="store_true")
+
+    # Control Experiments
+    parser.add_argument('--shuffle_sequence', default=False, action='store_true')
     return parser
 
 def get_model(args):
@@ -248,6 +252,8 @@ def main(args):
             dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=True, seed=seed
         )
     else:
+        global_rank = 0
+        num_tasks = 1
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.RandomSampler(dataset_val)
 
@@ -353,24 +359,6 @@ def main(args):
             data_loader_train.sampler.set_epoch(epoch)
             data_loader_val.sampler.set_epoch(epoch)
 
-        # if epoch == 10:
-        #     for p in model_without_ddp.encoder.parameters():
-        #         p.requires_grad=True
-            # if args.distributed:
-            #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=False)
-            #     model_without_ddp = model.module
-        # if linear_model is not None:
-        #     model_opt = (model, linear_model)
-        # else:
-        #     model_opt = model
-        # if args.schedule_free:
-        #     args.opt = 'adamWScheduleFree'
-        #     if args.warmup_epochs > 0 and args.warmup_steps <= 0:
-        #         args.warmup_steps = args.warmup_epochs * num_training_steps_per_epoch
-        #     optimizer = create_optimizer(args, model_opt, filter_bias_and_bn=False)
-        # else:
-        #     optimizer = create_optimizer(args, model_opt)                    
-
         train_stats = autoreg_train_one_epoch(
             model, data_loader_train,
             optimizer, device, epoch, loss_scaler,
@@ -386,12 +374,12 @@ def main(args):
             n_frames=args.num_frames,
             schedule_free=args.schedule_free,
             linear_model=linear_model,
-            linear_optimizer=linear_optimizer,
             feature_loss=args.feature_loss,
             log_writer=log_writer,
             camera_params_enabled=args.camera_params,
             categorical_camera=args.categorical_camera,
             alpha=(args.alpha_c, args.alpha_f),
+            shuffle_sequence=args.shuffle_sequence,
             args=args
         )
 

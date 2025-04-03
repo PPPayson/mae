@@ -1,3 +1,4 @@
+import math
 import torch
 import torchvision.transforms.functional as F
 import warnings
@@ -6,6 +7,8 @@ import numpy as np
 import torchvision
 from PIL import Image, ImageOps
 import numbers
+from collections.abc import Sequence
+from typing import Optional
 
 class GroupRandomFlip(object):
     def __init__(self, p=0.5):
@@ -14,11 +17,12 @@ class GroupRandomFlip(object):
     def __call__(self, img_tuple):
         img_group, label = img_tuple
         out_images = []
-        if torch.rand(1) < self.p:
+        if torch.rand(1).item() < self.p:
             return (img_group, label)
         for img in img_group:
             out_images.append(F.hflip(img))
         return (out_images, label)
+
 
 class GroupRandomCrop(object):
     def __init__(self, size):
@@ -74,15 +78,6 @@ class GroupNormalize(object):
         tensor.sub_(self.mean).div_(self.std)
         return (tensor,label)
 
-
-class GroupGrayScale(object):
-    def __init__(self, size):
-        self.worker = torchvision.transforms.Grayscale(size)
-
-    def __call__(self, img_tuple):
-        img_group, label = img_tuple
-        return ([self.worker(img) for img in img_group], label)
-
     
 class GroupScale(object):
     """ Rescales the input PIL.Image to the given 'size'.
@@ -103,20 +98,191 @@ class GroupScale(object):
 
 class GroupColorJitter(object):
 
-    def __init__(self, brightness=None, contrast=(0.2, 1.2), saturation=(0.5, 1.5), hue=(-0.5, 0.5)):
-        self.brightness = brightness
-        self.contrast = contrast
-        self.saturation = saturation
-        self.hue = hue
+    def __init__(self, brightness=0, contrast=(0.2, 1.2), saturation=(0.5, 1.5), hue=(-0.5, 0.5), shared=True):
+        self.brightness = self._check_input(brightness, 'brightness')
+        self.contrast = self._check_input(contrast, 'contrast')
+        self.saturation = self._check_input(saturation, 'saturation')
+        self.hue = self._check_input(hue, "hue", center=0, bound=(-0.5, 0.5), clip_first_on_zero=False)
+        self.shared=shared
+   
+    @torch.jit.unused
+    def _check_input(self, value, name, center=1, bound=(0, float("inf")), clip_first_on_zero=True):
+        if isinstance(value, numbers.Number):
+            if value < 0:
+                raise ValueError(f"If {name} is a single number, it must be non negative.")
+            value = [center - float(value), center + float(value)]
+            if clip_first_on_zero:
+                value[0] = max(value[0], 0.0)
+        elif isinstance(value, (tuple, list)) and len(value) == 2:
+            value = [float(value[0]), float(value[1])]
+        else:
+            raise TypeError(f"{name} should be a single number or a list/tuple with length 2.")
+
+        if not bound[0] <= value[0] <= value[1] <= bound[1]:
+            raise ValueError(f"{name} values should be between {bound}, but got {value}.")
+
+        # if value is 0 or (1., 1.) for brightness/contrast/saturation
+        # or (0., 0.) for hue, do nothing
+        if value[0] == value[1] == center:
+            return None
+        else:
+            return tuple(value)
 
     def __call__(self, img_tuple):
         img_group, label = img_tuple
-        params = torchvision.transforms.ColorJitter.get_params(brightness=None, contrast=self.contrast, saturation=self.saturation, hue=self.hue)
-        img_group = [F.adjust_contrast(img, params[2]) for img in img_group]
-        img_group = [F.adjust_saturation(img, params[3]) for img in img_group]
-        img_group = [F.adjust_hue(img, params[4]) for img in img_group]
-        return (img_group, label)
+        if self.shared:
+            fn_idx, brightness_factor, \
+            contrast_factor, saturation_factor, \
+            hue_factor = torchvision.transforms.ColorJitter.get_params(
+                        self.brightness, self.contrast, self.saturation, self.hue
+                        )
+            for fn_id in fn_idx:
+                if fn_id == 0 and brightness_factor is not None:
+                    img_group = [F.adjust_brightness(img, brightness_factor) for img in img_group]
+                elif fn_id == 1 and contrast_factor is not None:
+                    img_group = [F.adjust_contrast(img, contrast_factor) for img in img_group]
+                elif fn_id == 2 and saturation_factor is not None:
+                    img_group = [F.adjust_saturation(img,saturation_factor) for img in img_group]
+                elif fn_id == 3 and hue_factor is not None:
+                    img_group = [F.adjust_hue(img,hue_factor) for img in img_group]
+            return (img_group, label)
 
+        else:
+            transformed = []
+            for img in img_group:
+                fn_idx, brightness_factor, \
+                contrast_factor, saturation_factor, \
+                hue_factor = torchvision.transforms.ColorJitter.get_params(
+                            self.brightness, self.contrast, self.saturation, self.hue
+                            )
+                for fn_id in fn_idx:
+                    if fn_id == 0 and brightness_factor is not None:
+                        img = F.adjust_brightness(img, brightness_factor)
+                    elif fn_id == 1 and contrast_factor is not None:
+                        img = F.adjust_contrast(img, contrast_factor)
+                    elif fn_id == 2 and saturation_factor is not None:
+                        img = F.adjust_saturation(img, saturation_factor)
+                    elif fn_id == 3 and hue_factor is not None:
+                        img = F.adjust_hue(img, hue_factor)
+                transformed.append(img)
+            return (transformed, label)
+
+class GroupRandomGrayScale(object):
+    def __init__(self, p=0.1, shared=True):
+        self.p = p
+        self.shared=shared
+    def __call__(self, img_tuple):
+        img_group, label = img_tuple
+        transformed = []
+        num_output_channels, _, _ = F.get_dimensions(img_group[0])
+        if not self.shared:
+            for img in img_group:
+                if torch.rand(1).item() < self.p:
+                    transformed.append(F.rgb_to_grayscale(img, num_output_channels=num_output_channels))
+                else:
+                    transformed.append(img)
+        else:
+            if torch.rand(1).item() < self.p:
+                for img in img_group:
+                    transformed.append(F.rgb_to_grayscale(img, num_output_channels=num_output_channels))
+            else:
+                transformed = img_group
+        return (transformed, label)
+
+class GroupGaussianBlur(object):
+    def __init__(self, sigma=(0.1, 2.0), shared=True):
+        # self.kernel_size = torchvision.transforms.transforms._setup_size(kernel_size, "Kernel size should be a tuple/list of two integers")
+        # for ks in self.kernel_size:
+        #     if ks <= 0 or ks % 2 == 0:
+        #         raise ValueError("Kernel size value should be an odd and positive number.")
+
+        if isinstance(sigma, numbers.Number):
+            if sigma <= 0:
+                raise ValueError("If sigma is a single number, it must be positive.")
+            sigma = (sigma, sigma)
+        elif isinstance(sigma, Sequence) and len(sigma) == 2:
+            if not 0.0 < sigma[0] <= sigma[1]:
+                raise ValueError("sigma values should be positive and of the form (min, max).")
+        else:
+            raise ValueError("sigma should be a single number or a list/tuple with length 2.")
+
+        self.sigma = sigma
+        self.shared = shared
+    
+    def __call__(self, img_tuple):
+        img_group, label = img_tuple
+        if self.shared:
+            sigma = torchvision.transforms.GaussianBlur.get_params(self.sigma[0], self.sigma[1])
+            kernel_size = (math.ceil(6*sigma[0])+1, math.ceil(6*sigma[1])+1)
+            img_group = [F.gaussian_blur(img, kernel_size, [sigma, sigma]) for img in img_group]
+            return (img_group, label)
+        else:
+            transformed = []
+            for img in img_group:
+                sigma = torchvision.transforms.GaussianBlur.get_params(self.sigma[0], self.sigma[1])
+                kernel_size = (2*math.ceil(3*sigma)+1, 2*math.ceil(3*sigma)+1)
+                transformed.append(F.gaussian_blur(img, kernel_size, [sigma, sigma]))
+            return (transformed, label)
+
+class GroupRandomSolarize(object):
+    def __init__(self, threshold, p=0.5, shared=True):
+        self.threshold = threshold
+        self.p = p
+        self.shared = shared
+    
+    def __call__(self, img_tuple):
+        img_group, label = img_tuple
+        if self.shared:
+            if torch.rand(1).item() < self.p:
+                img_group = [F.solarize(img, self.threshold) for img in img_group]
+            return (img_group, label)
+        else:
+            transformed = []
+            for img in img_group:
+                if torch.rand(1).item() < self.p:
+                    img = F.solarize(img, self.threshold)
+                transformed.append(img)
+            return (transformed, label)
+
+class GroupRandomResizedCrop(object):
+    def __init__(self,
+                input_size,
+                scale=(0.08, 1.0),
+                ratio=(3.0 / 4.0, 4.0 / 3.0),
+                interpolation=F.InterpolationMode.BILINEAR,
+                antialias: Optional[bool]=True,
+                shared: bool = True):
+        super().__init__()
+        self.size = torchvision.transforms.transforms._setup_size(input_size, error_msg="Please provide only two dimensions (h, w) for size.")
+        if not isinstance(scale, Sequence):
+            raise TypeError("Scale should be a sequence")
+        if not isinstance(ratio, Sequence):
+            raise TypeError("Ratio should be a sequence")
+        if (scale[0] > scale[1]) or (ratio[0] > ratio[1]):
+            warnings.warn("Scale and ratio should be of kind (min, max)")
+
+        if isinstance(interpolation, int):
+            interpolation = torchvision.transforms.transforms._interpolation_modes_from_int(interpolation)
+
+        self.interpolation = interpolation
+        self.antialias = antialias
+        self.scale = scale
+        self.ratio = ratio
+        self.shared = shared
+
+    def __call__(self, img_tuple):
+        img_group, label = img_tuple
+        if self.shared:
+            # Assume all images are of the same size
+            img = img_group[0]
+            i, j, h, w = torchvision.transforms.transforms.RandomResizedCrop.get_params(img, self.scale, self.ratio)
+            for i, img in enumerate(img_group):
+                img_group[i] = F.resized_crop(img, i, j, h, w, self.size, self.interpolation, antialias=self.antialias)
+        else:
+            for i, img in enumerate(img_group):
+                i, j, h, w = torchvision.transforms.transforms.RandomResizedCrop.get_params(img, self.scale, self.ratio)
+                img_group[i] = F.resized_crop(img, i, j, h, w, self.size, self.interpolation, antialias=self.antialias)
+        return (img_group, label)
 
 class GroupMultiScaleCrop(object):
 
@@ -127,7 +293,7 @@ class GroupMultiScaleCrop(object):
         self.more_fix_crop = more_fix_crop
         self.input_size = input_size if not isinstance(input_size, int) else [input_size, input_size]
         # self.interpolation = Image.BILINEAR
-        self.interpolation = torchvision.transforms.functional.InterpolationMode.BILINEAR
+        self.interpolation =F.InterpolationMode.BILINEAR
 
     def __call__(self, img_tuple):
         img_group, label = img_tuple
@@ -135,8 +301,8 @@ class GroupMultiScaleCrop(object):
 
         crop_w, crop_h, offset_w, offset_h = self._sample_crop_size(im_size)
         
-        crop_img_group = [torchvision.transforms.functional.crop(img, offset_w, offset_h, crop_w, crop_h) for img in img_group]
-        ret_img_group = [torchvision.transforms.functional.resize(img, (self.input_size[0], self.input_size[1]), self.interpolation) for img in crop_img_group]
+        crop_img_group = [F.crop(img, offset_w, offset_h, crop_w, crop_h) for img in img_group]
+        ret_img_group = [F.resize(img, (self.input_size[0], self.input_size[1]), self.interpolation) for img in crop_img_group]
 
         return (ret_img_group, label)
 
@@ -231,7 +397,8 @@ class ToTorchFormatTensor(object):
             img = img.view(pic.size[1], pic.size[0], len(pic.mode))
             # put it from HWC to CHW format
             # yikes, this transpose takes 80% of the loading time/CPU
-            img = img.transpose(0, 1).transpose(0, 2).contiguous()
+            # img = img.transpose(0, 1).transpose(0, 2).contiguous()
+            img = img.permute((2, 0, 1)).contiguous()
         return (img.float().div(255.) if self.div else img.float(), label)
 
 
@@ -239,3 +406,4 @@ class IdentityTransform(object):
 
     def __call__(self, data):
         return data
+

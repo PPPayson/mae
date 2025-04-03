@@ -1,21 +1,30 @@
 module load libjpeg-turbo
-OUTPUT_DIR='outs/autoreg_vit_small_patch16_cam_video_0129/'
+OUTPUT_DIR='outs/ibot/ibot_vit_small_patch16_scratch_0317'
 export HUGGINGFACE_HUB_CACHE=./pretrained_ckpts
 
 DATA_PATH='data_lists/co3d_train.txt'
 DATA_VAL_PATH='data_lists/co3d_val.txt'
 DATA_ROOT='/oscar/data/tserre/Shared/'
+TORCH_DISTRIBUTED_DEBUG=INFO
 
-python  -m tools.eval_alignment \
+NCCL_DEBUG=INFO OMP_NUM_THREADS=1  python3 -m torch.distributed.run \
+     --standalone \
+     --nnodes=1 \
+     --nproc_per_node=2 \
+      main_pretrain_dino.py \
         --num_workers 16 \
         --data_root ${DATA_ROOT} \
         --data_path ${DATA_PATH} \
         --data_val_path ${DATA_VAL_PATH} \
-        --mask_type autoregressive \
-        --mask_ratio 0.75 \
-        --model autoreg_beit_large_patch16 \
-        --batch_size 64 \
-        --lr 0.015 \
+        --mask_type block \
+        --mask_ratio 0 0.5 \
+        --mask_ratio_var 0 0.2 \
+        --local_crops_number 10 \
+        --global_crops_scale 0.25 1 \
+        --local_crops_scale 0.05 0.25 \
+        --model ibot_2d_vit_small_patch16 \
+        --batch_size 6 \
+        --lr 0.0005 \
         --no-binocular \
         --num_frames 8 \
         --weight_decay 0.01 \
@@ -38,13 +47,12 @@ python  -m tools.eval_alignment \
         --use_cce \
         --num_classes 1000 \
         --attn_drop_rate 0 \
-        --drop_path 0 \
         --categorical_camera \
-        --feature_loss \
-        --decoder_pos_embed learned_3d \
-        --clickmaps_human_path ./assets/human_ceiling_split_half_co3d_val.npz \
-        --clickmaps_path ./assets/co3d_val_processed.npz \
-        --imgnet_clickmaps_path ./assets/jay_imagenet_for_co3d_val_0.1_processed.npz \
-        --imgnet_clickmaps_human_path ./assets/human_ceiling_split_half_jay_imagenet_for_co3d_val_0.1.npz \
-        --ckpt_path outs/results/autoreg_beit_large_patch16_no_cam_lr0005_0212/checkpoint-0.pth \
-        --linear_probe
+        --camera_params \
+        --drop_path 0.1 \
+        --out_dim 4096 \
+        --pos_embed 2d \
+        --timm_pool \
+        --multi_crop \
+        --not_pretrained \
+        --single_video

@@ -137,11 +137,12 @@ class MultiviewDataset(torch.utils.data.Dataset):
                  is_binocular=False,
                  reverse_sequence=False,
                  length_divisor=1,
-                 camera_parameters_enabled=False
+                 camera_parameters_enabled=False,
+                 single_video=False,
                  ):
 
         super().__init__()
-
+        self.single_video = single_video
         self.data_root = data_root
         self.data_list = data_list
 
@@ -155,7 +156,6 @@ class MultiviewDataset(torch.utils.data.Dataset):
 
         self.camera_parameters_enabled = camera_parameters_enabled
         self.clips = self.make_dataset_samples()
-        
         num_valid_starts_per_clip = [max(0, (len(clip[2:]) - (self.new_length * self.new_step) + 1)) for clip in self.clips]
         self.num_frames_per_clip = [len(clip[2:]) for clip in self.clips]
         self.length = sum(num_valid_starts_per_clip)
@@ -187,8 +187,14 @@ class MultiviewDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         #clip_idx = index // self.num_valid_starts_per_clip[index]
         #start_frame_idx = index % self.num_valid_starts_per_clip[index]
-        clip_idx = self.start_indices[index][0]
-        start_frame_idx = index - self.start_indices[index][1]
+        if self.single_video:
+            clip_idx = index
+            num_frames = self.num_frames_per_clip[clip_idx]
+            start_frame_idx = np.random.choice(np.arange( num_frames-(self.new_length*self.new_step) + 1))
+        else:
+            clip_idx = self.start_indices[index][0]
+            start_frame_idx = index - self.start_indices[index][1]
+        
         clip = self.clips[clip_idx]
         label = clip[0]
         label = self.label_preprocessing.transform([label])
@@ -199,35 +205,52 @@ class MultiviewDataset(torch.utils.data.Dataset):
             camera_cats = torch.Tensor(camera_cats).to(torch.long)
             camera_params = torch.vstack(camera_params)
             process_data, mask = self.transform((images, None)) # T,C,H,W
+            org_data, _ = self.transform((images, None), train=False)
             if self.is_binocular:
                 mask = np.tile(mask, (1, 2, 1))
 
             # print("MASK IS:", mask)
-
-            process_data = process_data.view((self.new_length, 3) + process_data.size()[-2:]).transpose(0,1)  # T*C,H,W -> T,C,H,W -> C,T,H,W
+            if isinstance(process_data, list):
+                for i, data in enumerate(process_data):
+                    process_data[i] = rearrange(data, 'T C H W -> C T H W')
+                    org_data[i] = rearrange(org_data[i], 'T C H W -> C T H W')
+            else:
+                process_data = process_data.view((self.new_length, 3) + process_data.size()[-2:]).transpose(0,1)  # T*C,H,W -> T,C,H,W -> C,T,H,W
+                org_data = rearrange(org_data, 't c h w -> c t h w')
             if self.encoder_logits != None:
                 features = torch.vstack(features)
-                return (process_data, mask, camera_params, camera_cats, features, label)
-            return (process_data, mask, camera_params, camera_cats, label)
+                return (process_data, mask, camera_params, camera_cats, features, org_data, label)
+            return (process_data, mask, camera_params, camera_cats, org_data, label)
 
         else:
             images, features  = self.load_frames(clip, start_frame_idx, clip_idx)
             process_data, mask = self.transform((images, None)) # T,C,H,W
+            org_data, _ = self.transform((images, None), train=False)
+
             if self.is_binocular:
                 mask = np.tile(mask, (1, 2, 1))
+            if isinstance(process_data, list):
+                for i, data in enumerate(process_data):
+                    process_data[i] = rearrange(data, 'T C H W -> C T H W')
+                    org_data[i] = rearrange(org_data[i], 'T C H W -> C T H W')
+            else:
+                process_data = process_data.view((self.new_length, 3) + process_data.size()[-2:]).transpose(0,1)  # T*C,H,W -> T,C,H,W -> C,T,H,W
+                org_data = rearrange(org_data, 't c h w -> c t h w')
 
-            process_data = process_data.view((self.new_length, 3) + process_data.size()[-2:]).transpose(0,1)  # T*C,H,W -> T,C,H,W -> C,T,H,W
             if self.encoder_logits is not None:
                 features = torch.vstack(features)
-                return (process_data, mask, features, label)
-            return (process_data, mask, label)
+                return (process_data, mask, features, org_data, label)
+            return (process_data, mask, org_data, label)
 
     def __len__(self):
         # Multiply by the number of frames in each sequence
         # For Pre-training Co3D, multiply by 50
         # For Greebles, multiply by 180
-        data_len = self.length
-        data_len //= self.length_divisor
+        if not self.single_video:
+            data_len = self.length
+            data_len //= self.length_divisor
+        else:
+            data_len = len(self.clips)
         return data_len
 
     def load_frames_and_params(self, clip, start_frame_idx, clip_idx):
@@ -351,6 +374,7 @@ class MultiviewDataset(torch.utils.data.Dataset):
         all_seqs = [line.split() for line in lines]
         return all_seqs
 
+
 class Co3dLpDataset(torch.utils.data.Dataset):
     def __init__(self,
                  root,
@@ -434,6 +458,74 @@ class Co3dLpDataset(torch.utils.data.Dataset):
         all_seqs = [line.split() for line in lines]
         return all_seqs
 
+
+class Co3dLpDatasetNew(torch.utils.data.Dataset):
+    def __init__(self,
+                 root,
+                 train=True,
+                 datapath="",
+                 transform=None,
+                 reverse_sequence=False):
+
+        super(Co3dLpDatasetNew, self).__init__()
+        self.root = root
+        self.train = train
+        self.datapath = datapath
+        self.transform = transform
+        self.reverse_sequence = reverse_sequence
+        self.clips = self.make_dataset_samples()
+        if len(self.clips) == 0:
+            raise(RuntimeError("Found 0 video clips in subfolders of: " + root + "\n"
+                                "Check your data directory (opt.data-dir)."))
+        self.num_frames_per_clip = [len(clip[2:]) for clip in self.clips]
+        self.length = sum(self.num_frames_per_clip)
+
+        # Might need to add check for first video has no valid start
+        self.start_indices = [[0, 0]]*self.num_frames_per_clip[0]
+        for i in range(len(self.num_frames_per_clip)-1):
+            self.start_indices += [[i+1, self.start_indices[-1][1]+self.num_frames_per_clip[i]]] * self.num_frames_per_clip[i+1]        
+        # Preprocessing the label
+        labels = []
+        for clip in self.clips:
+            labels.append(str(clip[0]))
+
+        labels = np.unique(labels)
+        self.label_preprocessing = preprocessing.LabelEncoder()
+        self.label_preprocessing.fit(np.array(labels))
+
+    def __getitem__(self, index):
+        clip_idx = self.start_indices[index][0]
+        start_frame_idx = index - self.start_indices[index][1]
+        clip = self.clips[clip_idx]
+        label = clip[0]
+        label = self.label_preprocessing.transform([label])
+        label = torch.tensor(label)[0]
+        image = self.load_frame(clip, start_frame_idx, clip_idx)
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+    def __len__(self):
+        return self.length
+
+    def load_frame(self, clip, start_frame_idx, clip_idx):
+        fname = os.path.join(self.root, clip[1])
+        frames_list = clip[2:]
+        if not (os.path.exists(fname)):
+            raise RuntimeError(f"{fname} DOES NOT EXIST***********")
+        fno = start_frame_idx % len(frames_list)
+        img = Image.open(os.path.join(fname, frames_list[fno])).convert('RGB')  # Open the image
+
+        return img
+
+    def make_dataset_samples(self):
+        with open(self.datapath, 'r') as fopen:
+            lines = fopen.readlines()
+        all_seqs = [line.split() for line in lines]
+        return all_seqs
+
 class EmbeddingDataset(Dataset):
     def __init__(self, embeddings, labels):
         self.embeddings = embeddings
@@ -473,6 +565,65 @@ class AlignmentDataset(Dataset):
                 heatmaps = all_data[img_name].tolist()['heatmap']
                 self.ceiling.append(all_ceiling[i])
                 self.image_files.append(all_data[img_name].tolist()['image'])
+                self.heatmaps.append(heatmaps)
+                self.image_names.append(img_name)
+                self.categories.append(cat)
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img_file = self.image_files[idx]
+        img_label = self.image_names[idx].split('/')[0]
+        img_name = self.image_names[idx]
+        if self.label_dict is not None:
+            img_label = self.label_dict[img_label]
+        numeric_label = torch.tensor(self.label_to_index[img_label], dtype=torch.long)
+        heatmap = self.heatmaps[idx]
+        if self.transform:
+            image = self.transform(img_file.convert("RGB"))
+        else:
+            image = img_file
+        cat = self.categories[idx]
+        ceiling = self.ceiling[idx]
+        return image, heatmap, numeric_label, img_name, cat, ceiling
+
+
+class AlignmentDatasetFolder(Dataset):
+    def __init__(self, numpy_file, human_results_file, label_to_index, label_dict=None, transform=None, dataset_name='co3d'):
+        super(AlignmentDatasetFolder, self).__init__()
+        self.image_names = []
+        self.image_files = []
+        self.heatmaps = []
+        self.categories = []
+        self.transform = transform
+        self.label_to_index = label_to_index
+        self.label_dict = label_dict
+        self.dataset_name = dataset_name
+        # all_data = np.load(numpy_file, allow_pickle=True)
+        human_data = np.load(human_results_file, allow_pickle=True)
+        all_hmps_names = os.listdir(numpy_file)
+        for i, h in enumerate(all_hmps_names):
+            all_hmps_names[i] = '.'.join(h.split('.')[:-1])
+        filtered_imgs = human_data['final_clickmaps'].tolist().keys()
+        all_ceiling = human_data['ceiling_correlations'].tolist()
+        all_null = human_data['null_correlations'].tolist()
+        self.null = np.mean(all_null)
+        # self.ceiling = np.mean(all_ceiling)
+        self.ceiling = []
+        for i, img_name in enumerate(filtered_imgs):
+            cat = img_name.split('/')[0]
+            if label_dict is not None:
+                cat = label_dict[cat]
+            #if img_name in all_data.files and all_ceiling[i] > 0:
+            #    heatmaps = all_data[img_name].tolist()['heatmap']
+            print(img_name)
+            if img_name in all_hmps_names:
+                heatmaps = np.load(os.path.join(numpy_files, img_name), allow_pickle=True)
+                print(heatmaps.shape)
+                # img = 
+                self.ceiling.append(all_ceiling[i])
+                # self.image_files.append(all_data[img_name].tolist()['image'])
                 self.heatmaps.append(heatmaps)
                 self.image_names.append(img_name)
                 self.categories.append(cat)

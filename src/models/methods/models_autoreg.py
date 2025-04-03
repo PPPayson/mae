@@ -6,9 +6,9 @@ import torch.nn as nn
 from einops import rearrange
 from src.util.pos_embed import get_2d_sincos_pos_embed, get_3d_sincos_pos_embed
 # from src.models.models_encoder import EncoderViT
-from src.models.models_decoder import DecoderViT
+from src.models.backbones.models_decoder import DecoderViT
 from src.util.misc import get_cvm_attn_mask
-from src.models import models_encoder
+from src.models.backbones import models_encoder
 
 class AutoregViTtimm(nn.Module):
     def __init__(self,
@@ -78,9 +78,10 @@ class AutoregViTtimm(nn.Module):
             grid_size = int(self.encoder.patch_embed.num_patches**0.5)
             self.pos_embed.data.copy_(torch.from_numpy(get_2d_sincos_pos_embed(decoder_embed_dim, grid_size)).float().unsqueeze(0))
         elif decoder_pos_embed == '3d':
-            # self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, decoder_embed_dim), requires_grad=False)
-            # grid_size = int(self.encoder.patch_embed.num_patches**0.5)
-            # self.pos_embed.data.copy_(torch.from_numpy(get_3d_sincos_pos_embed(decoder_embed_dim, (grid_size, grid_size, self.time_steps))).float().unsqueeze(0))            
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, decoder_embed_dim), requires_grad=False)
+            grid_size = int(self.encoder.patch_embed.num_patches**0.5)
+            self.pos_embed.data.copy_(torch.from_numpy(get_3d_sincos_pos_embed(decoder_embed_dim, (grid_size, grid_size, self.time_steps))).float().unsqueeze(0))            
+        elif decoder_pos_embed == 'learned_3d':
             self.temporal_embed = nn.Parameter(torch.zeros(1, self.time_steps, 1, decoder_embed_dim))
             self.pos_embed = nn.Parameter(torch.zeros(1, self.encoder.patch_embed.num_patches, decoder_embed_dim))
 
@@ -125,9 +126,11 @@ class AutoregViTtimm(nn.Module):
             x_cls_token = x[:, :1, :]
             x = x [:, 1:, :]
 
-        if self.decoder_pos_embed == '3d':
+        if self.decoder_pos_embed == 'learned_3d':
+            B, N, C = x.shape
             expand_temporal_embed = self.temporal_embed.expand(batch_size, -1, -1, -1).type_as(x).to(x.device)
             expand_temporal_embed = rearrange(expand_temporal_embed, 'b t n c -> (b t) n c')
+            expand_pos_embed = self.pos_embed.expand(B, -1, -1).type_as(x).to(x.device)
             x = x + self.pos_embed + expand_temporal_embed
         else:
             x = rearrange(x, '(b t) n c -> b (t n) c', t=self.time_steps)

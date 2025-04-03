@@ -128,6 +128,8 @@ class Attention(nn.Module):
             rel_embed = self._get_rel_pos_bias()
             if not f2d:
                 rel_embed = rel_embed.repeat(1, 1, num_frames, num_frames)
+            if attn.shape[2] != rel_embed.shape[2]:
+                rel_embed = rel_embed[:, :, :attn.shape[2], :attn.shape[3]]
             attn = attn + rel_embed            
             # attn = attn + self._get_rel_pos_bias()
         if self.temporal_embed:
@@ -145,11 +147,10 @@ class Attention(nn.Module):
         if attn_mask is not None:
             attn_mask = attn_mask.to(torch.bool)
             attn = attn.masked_fill(~attn_mask, float('-inf'))
-
         attn = attn.softmax(dim=-1)
+        attn = torch.nan_to_num(attn, nan=0)
         attn = self.attn_drop(attn)
         x = attn @ v
-
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -242,6 +243,8 @@ class RelativePositionBias(nn.Module):
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
             self.window_area + 1, self.window_area + 1, -1)  # Wh*Ww,Wh*Ww,nH
         return relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+
+        
 class Beit(nn.Module):
     """ Vision Transformer with support for patch or hybrid CNN input stage
     """
@@ -273,22 +276,30 @@ class Beit(nn.Module):
             head_init_scale: float = 0.001,
             pos_embed: str = '2d',
             time_steps: int = 1,
+            use_masked_im_modeling: bool = False,
             **kwargs
     ):
         super().__init__()
         # self.time_steps = time_steps
         # self.pos_embed_type = pos_embed
+        self.patch_size = patch_size
+        self.use_masked_im_modeling = use_masked_im_modeling
         self.num_classes = num_classes
         self.global_pool = global_pool
         self.num_features = self.head_hidden_size = self.embed_dim = embed_dim  # for consistency with other models
         self.num_prefix_tokens = 1
         self.grad_checkpointing = False
-
+        if use_masked_im_modeling:
+            self.masked_embed = nn.Parameter(torch.zeros(1, embed_dim))
+        else:
+            self.masked_embed = nn.Parameter(torch.zeros(1, embed_dim), requires_grad=False)
         self.patch_embed = PatchEmbed(
             img_size=img_size,
             patch_size=patch_size,
             in_chans=in_chans,
             embed_dim=embed_dim,
+            flatten=False,
+            strict_img_size=False
         )
         num_patches = self.patch_embed.num_patches
         r = self.patch_embed.feat_ratio() if hasattr(self.patch_embed, 'feat_ratio') else patch_size
@@ -501,28 +512,58 @@ class Beit(nn.Module):
     #     x = self.head_drop(x)
     #     return x if pre_logits else self.head(x)
 
-    def forward(self, x, attn_mask=None, num_frames=1, pool=True, f2d=False, temporal_embed=None):
+    def forward_head(self, x, pre_logits: bool = False):
+        return self.head_drop(self.fc_norm(x))
+        
+    def forward_features(self, x, attn_mask=None, num_frames=1, pool=True, f2d=False, temporal_embed=None, return_all_tokens=False, mask=None):
         # if f2d and temporal_embed is not None:
         #     temporal_embed = torch.zeros(temporal_embed[:, :1, :, :].shape).to(x.device)
-        x = self.patch_embed(x)
-        x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
-        if self.pos_embed is not None:
-            x = x + self.pos_embed
-        x = self.pos_drop(x)
 
+        if self.use_masked_im_modeling:
+            assert mask is not None
+            x = self.prepare_tokens(x, mask=mask)
+        else:
+            x = self.prepare_tokens(x)
         rel_pos_bias = self.rel_pos_bias() if self.rel_pos_bias is not None else None
         if not f2d:
             x = rearrange(x, '(b t) n c -> b (t n) c', t=num_frames)
+
         for blk in self.blocks:
             x = blk(x, shared_rel_pos_bias=rel_pos_bias, attn_mask=attn_mask, num_frames=num_frames, f2d=f2d)
         x = self.norm(x)
-        if pool:
+        if pool and not return_all_tokens:
             if not f2d:
+
                 x = rearrange(x, 'b (t n) c -> (b t) n c', t=num_frames)
                 x = self.fc_norm(x[:, self.num_prefix_tokens:].mean(dim=1)) if self.global_pool == 'avg' else x[:, 0]
                 return x
             x = self.fc_norm(x[:, self.num_prefix_tokens:].mean(dim=1)) if self.global_pool == 'avg' else x[:, 0]
             return x
         else:
+            if not f2d:
+                x = rearrange(x, 'b (t n) c -> (b t) n c', t=num_frames)
+            x[:, 0] = self.fc_norm(x[:, 1:, :].mean(1))
             return x
+        
 
+    def forward(self, x, attn_mask=None, num_frames=1, pool=True, f2d=False, temporal_embed=None, mask=None):
+        return self.forward_features(x, attn_mask, num_frames, pool, f2d, temporal_embed, mask=mask)
+
+
+    def prepare_tokens(self, x, mask=None):
+        x = self.patch_embed(x)
+
+        if mask is not None:
+            x = self.mask_model(x, mask)
+        x = x.flatten(2).transpose(1, 2)
+
+        x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
+        if self.pos_embed is not None:
+            x = x + self.pos_embed
+        x = self.pos_drop(x)
+
+        return x
+
+    def mask_model(self, x, mask):
+        x.permute(0, 2, 3, 1)[mask, :] = self.masked_embed.to(x.dtype)
+        return x    

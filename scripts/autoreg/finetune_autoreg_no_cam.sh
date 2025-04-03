@@ -1,5 +1,5 @@
 module load libjpeg-turbo
-OUTPUT_DIR='outs/autoreg_vit_small_patch16_no_cam_0218'
+OUTPUT_DIR='outs/autoreg_vit_small_patch16_no_cam_0321'
 export HUGGINGFACE_HUB_CACHE=./pretrained_ckpts
 
 DATA_PATH='data_lists/co3d_train.txt'
@@ -46,7 +46,8 @@ NCCL_DEBUG=INFO OMP_NUM_THREADS=1  python3 -m torch.distributed.run \
         --drop_path 0 \
         --categorical_camera \
         --feature_loss \
-        --decoder_pos_embed 3d 
+        --decoder_pos_embed learned_3d \
+        --alpha_f 0.5
         #--not_pretrained \
         #--clip_grad 1 \
         # --decoder_cls \

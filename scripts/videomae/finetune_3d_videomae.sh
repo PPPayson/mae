@@ -1,6 +1,7 @@
 module load libjpeg-turbo
 OUTPUT_DIR='outs/video_mae/videomae_vit_small_patch16_tube_3d_encoder_3d_patch_0219'
 export HUGGINGFACE_HUB_CACHE=./pretrained_ckpts
+export TIMM_FUSED_ATTN=0
 
 DATA_PATH='data_lists/co3d_train.txt'
 DATA_VAL_PATH='data_lists/co3d_val.txt'
@@ -44,11 +45,10 @@ NCCL_DEBUG=INFO OMP_NUM_THREADS=1  python3 -m torch.distributed.run \
         --attn_drop_rate 0 \
         --drop_path 0.1 \
         --categorical_camera \
-        --feature_loss \
         --decoder_pos_embed 1d_spatial \
         --no-normalize_target \
-        --tubelet_size 2 \
-        --no_wandb           
+        --tubelet_size 2
+        # --feature_loss \
         #--clip_grad 1 \
         # --decoder_cls \
         # --use_cls \

@@ -1,7 +1,7 @@
 import torch
 import os
 from tqdm import tqdm
-from src.models.models_encoder import LinearModel
+from src.models.backbones.models_encoder import LinearModel
 from src.data.co3d_dataset import EmbeddingDataset
 from torch.utils.data import DataLoader
 import torch.nn as nn

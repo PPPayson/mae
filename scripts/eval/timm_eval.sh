@@ -8,7 +8,7 @@ DATA_ROOT='/oscar/data/tserre/Shared/'
 
 python main_timm_linear_probe.py \
     --model vit_small_patch16_224.augreg_in21k_ft_in1k\
-    --num_workers 8 \
+    --num_workers 16 \
     --batch_size 128 \
     --data_root ${DATA_ROOT} \
     --data_path ${DATA_PATH} \

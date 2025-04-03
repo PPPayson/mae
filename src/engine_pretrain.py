@@ -36,7 +36,7 @@ def dino_train_one_epoch(model: torch.nn.Module,
                         schedule_free=False, 
                         categorical_camera=False, 
                         alpha=0.5,
-                        momentum_schedule=1, 
+                        momentum_schedule=1,
                         args=None):
     model.train()
     if schedule_free:
@@ -50,14 +50,34 @@ def dino_train_one_epoch(model: torch.nn.Module,
         it = start_steps + data_iter_step
         momentum = momentum_schedule[it]
         videos = batch[0]
+        bool_masked_pos = batch[1]
+        org_videos = batch[-2]
+        org_videos = rearrange(org_videos, 'b t c h w -> b c t h w')
         true_camera_params = None
+        if isinstance(bool_masked_pos, list):
+            for i, m in enumerate(bool_masked_pos):
+                window_size = int(math.sqrt(m.shape[1]//args.num_frames))
+                m = rearrange(m, 'b (t h w) -> (b t) h w', t=args.num_frames, h=window_size, w=window_size)
+                bool_masked_pos[i] = m.to(device, non_blocking=True).to(torch.bool)
+            # bool_masked_pos = [m.to(device, non_blocking=True) for m in bool_masked_pos]
+        else:
+            window_size = int(math.sqrt(bool_masked_pos.shape[1]//args.num_frames))
+            bool_masked_pos = rearrange(bool_masked_pos, 'b (t h w) -> (b t) h w', h=window_size, t=args.num_frames)
+            bool_masked_pos = bool_masked_pos.to(device, non_blocking=True).to(torch.bool)
         if camera_params_enabled:
             true_camera_params = batch[2].to(device, non_blocking=True)
             camera_param_cats = batch[3].to(device, non_blocking=True)
-        videos = videos.to(device, non_blocking=True)
+        if isinstance(videos, list):
+            videos = [v.to(device, non_blocking=True) for v in videos]
+        else:
+            videos = videos.to(device, non_blocking=True)
         with torch.cuda.amp.autocast(enabled=True):
-            outputs = model(videos)
-            loss = model_without_ddp.calculate_loss(outputs['student_output'], outputs['teacher_output'], epoch)
+            if 'ibot' in args.model or 'latent_mae' in args.model:
+                outputs = model(videos, org_videos, bool_masked_pos)
+                loss = model_without_ddp.calculate_loss(outputs['student_output'], outputs['teacher_output'], bool_masked_pos, epoch)
+            else:
+                outputs = model(videos, org_videos)
+                loss = model_without_ddp.calculate_loss(outputs['student_output'], outputs['teacher_output'], epoch)
             loss_value = loss.item()
         metric_logger.update(loss=loss_value)
         optimizer.zero_grad()
@@ -97,9 +117,9 @@ def autoreg_train_one_epoch(model: torch.nn.Module,
                             categorical_camera=False, 
                             alpha=(0.5, 0.5), 
                             linear_model=None, 
-                            linear_optimizer=None, 
                             feature_loss=False,
-                            eval_iter=False, 
+                            eval_iter=False,
+                            shuffle_sequence=False,
                             args=None):
     model.train()
     if linear_model is not None:
@@ -123,7 +143,13 @@ def autoreg_train_one_epoch(model: torch.nn.Module,
         params = list(params) + list(linear_model.parameters())
     for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         it = start_steps + data_iter_step
-        videos, bool_masked_pos = batch[0], batch[1]
+        videos, bool_masked_pos, org_videos = batch[0], batch[1], batch[-2]
+        # org_videos = rearrange(org_videos, 'b t c h w -> b c t h w')
+        if shuffle_sequence:
+            B, C, T, H, W = videos.shape
+            frame_indices = torch.randint(0, B, (B, T))
+            videos = videos[frame_indices, :, torch.arange(T)[None, :], :, :]
+            videos = rearrange(videos, 'b t c h w -> b c t h w')
         true_camera_params = None
         if camera_params_enabled:
             true_camera_params = batch[2].to(device, non_blocking=True)
@@ -134,13 +160,18 @@ def autoreg_train_one_epoch(model: torch.nn.Module,
             features = batch[2].to(device, non_blocking=True)
         
         videos = videos.to(device, non_blocking=True)
+        org_videos = org_videos.to(device, non_blocking=True)
         bool_masked_pos = bool_masked_pos.to(device, non_blocking=True).flatten(1).to(torch.bool)
         with torch.no_grad():
             unnorm_videos = videos * std + mean
             videos_patch = rearrange(unnorm_videos, 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=args.tubelet_size, p1=patch_size, p2=patch_size)
             B, _, C = videos_patch.shape
-            labels = videos_patch[bool_masked_pos].reshape(B, -1, C)
-        
+            if args.mask_type != 'none':
+                gt_videos_patch = rearrange((org_videos * std + mean), 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=args.tubelet_size, p1=patch_size, p2=patch_size)
+                labels = gt_videos_patch[bool_masked_pos].reshape(B, -1, C)
+            else:
+                gt_videos_patch = rearrange((org_videos * std + mean), 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=args.tubelet_size, p1=patch_size, p2=patch_size)
+                labels = gt_videos_patch.reshape(B, -1, C)
         with torch.cuda.amp.autocast(enabled=True):
             outputs = model(videos, camera=true_camera_params, mask=bool_masked_pos)
             pred_frames = outputs['pred_frames']
@@ -197,17 +228,20 @@ def autoreg_train_one_epoch(model: torch.nn.Module,
         metric_logger.synchronize_between_processes()
         if log_writer is not None:
             log_writer.set_step(it)
-            if it%100==0:
-                reconstruction=videos_patch.clone()
+            if it%1000==0:
+                reconstruction=gt_videos_patch.clone()
                 if use_cce:
                     pred_frames = torch.argmax(pred_frames, dim=1)/15.0
-                reconstruction[bool_masked_pos] = pred_frames.view(B*pred_frames.shape[1], -1).float()
+                if args.mask_type == 'none':
+                    reconstruction[~bool_masked_pos] = pred_frames.view(B*pred_frames.shape[1], -1).float()
+                else:
+                    reconstruction[bool_masked_pos] = pred_frames.view(B*pred_frames.shape[1], -1).float()
                 reconstruction = rearrange(reconstruction, 'b n (p c) -> b n p c', c=3)
-                videos_patch = rearrange(unnorm_videos[0:1], 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=1, p1=patch_size, p2=patch_size)
+                videos_patch = rearrange(unnorm_videos[0:1], 'b c (t p0) (h p1) (w p2) -> b (t h w) (p0 p1 p2 c)', p0=args.tubelet_size, p1=patch_size, p2=patch_size)
                 videos_patch_to_mask = copy.deepcopy(videos_patch)
                 videos_patch_to_mask[bool_masked_pos[0:1]] = 0
-                masked_inp = rearrange(videos_patch_to_mask, 'b (t h w) (p0 p1 p2 c) -> b (t p0) c (h p1) (w p2)', p0=1, p1=patch_size, p2=patch_size, w=14, h=14, t=n_frames)
-                reconstruction = rearrange(reconstruction, 'b (t h w) (p0 p1 p2) c -> b (t p0) c (h p1) (w p2)', p0=1, p1=patch_size, p2=patch_size, w=14, h=14, t=n_frames)
+                masked_inp = rearrange(videos_patch_to_mask, 'b (t h w) (p0 p1 p2 c) -> b (t p0) c (h p1) (w p2)', p0=args.tubelet_size, p1=patch_size, p2=patch_size, w=14, h=14, t=int(n_frames/args.tubelet_size))
+                reconstruction = rearrange(reconstruction, 'b (t h w) (p0 p1 p2) c -> b (t p0) c (h p1) (w p2)', p0=args.tubelet_size, p1=patch_size, p2=patch_size, w=14, h=14, t=int(n_frames/args.tubelet_size))
                 if use_cce:
                     unnorm_videos = (unnorm_videos*15).to(torch.long)/15.
                 log_writer.update(frames=[unnorm_videos[0].transpose(0, 1), reconstruction[0], masked_inp[0]], head="frames")
@@ -259,9 +293,9 @@ def train_one_epoch(model: torch.nn.Module,
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
         samples = samples[0]
+        
         if args.video_dataset:
             samples = rearrange(samples, 'b c t h w -> (b t) c h w')
-
         samples = samples.to(device, non_blocking=True)
 
         with torch.cuda.amp.autocast():

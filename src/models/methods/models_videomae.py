@@ -5,8 +5,8 @@ import torch.nn as nn
 
 from einops import rearrange
 from src.util.pos_embed import get_2d_sincos_pos_embed, get_3d_sincos_pos_embed, get_sinusoid_encoding_table
-from src.models import models_encoder
-from src.models.models_decoder import DecoderViT
+from src.models.backbones import models_encoder
+from src.models.backbones.models_decoder import DecoderViT
 from src.util.misc import get_cvm_attn_mask
 from timm.models.layers import trunc_normal_ as __call_trunc_normal_
 
@@ -48,18 +48,17 @@ class VideoMAETimm(nn.Module):
                 **kwargs
                 ):
         super().__init__()
-        print("PATCH", patch_embed_type)
+        self.time_steps = num_frames
         self.encoder =  models_encoder.__dict__[backbone_name](model_name=encoder_name, pretrained=pretrained,
                              attn_drop_rate=attn_drop_rate, drop_path_rate=drop_path_rate, encoder_3d=encoder_3d,
-                            patch_embed_type=patch_embed_type,tubelet_size=tubelet_size)
+                            patch_embed_type=patch_embed_type,tubelet_size=tubelet_size, time_steps=self.time_steps)
         self.model_name = encoder_name
         self.mask_type = mask_type
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
         trunc_normal_(self.mask_token, std=.02)
-        self.time_steps = num_frames
 
         self.decoder = DecoderViT(
-            num_classes=decoder_num_classes,
+            num_classes=decoder_num_classes*tubelet_size,
             embed_dim=decoder_embed_dim,
             depth=decoder_depth,
             num_heads=decoder_num_heads,
@@ -81,12 +80,15 @@ class VideoMAETimm(nn.Module):
         self.decoder_cls = decoder_cls
 
         self.encoder_cls = hasattr(self.encoder.model, 'cls_token') and self.encoder.model.cls_token is not None
-        num_patches = (self.encoder.patch_embed.num_patches + int((decoder_cls and self.encoder_cls)))*self.time_steps
-
+        # num_patches = (self.encoder.patch_embed.num_patches + int((decoder_cls and self.encoder_cls)))*self.time_steps
+        if encoder_3d:
+            time_steps = self.time_steps//tubelet_size
+        else:
+            time_steps = self.time_steps
         if self.decoder_pos_embed == '1d_spatial':
-            self.pos_embed = get_sinusoid_encoding_table(self.encoder.patch_embed.num_patches*self.time_steps + 0, decoder_embed_dim)
+            self.pos_embed = get_sinusoid_encoding_table(self.encoder.patch_embed.num_patches*time_steps + 0, decoder_embed_dim)
         elif self.decoder_pos_embed == '3d':
-            self.pos_embed = nn.Parameter(torch.zeros(1, self.encoder.patch_embed.num_patches*self.time_steps + 0, decoder_embed_dim), requires_grad=False)
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.encoder.patch_embed.num_patches*time_steps + 0, decoder_embed_dim), requires_grad=False)
             grid_size = int(self.encoder.patch_embed.num_patches**0.5)
             self.pos_embed.data.copy_(torch.from_numpy(get_3d_sincos_pos_embed(decoder_embed_dim, (grid_size, grid_size, self.time_steps))).float().unsqueeze(0))
 
@@ -127,11 +129,10 @@ class VideoMAETimm(nn.Module):
         if self.encoder_cls and not self.decoder_cls:
             x_cls_token = x[:, :1, :]
             x = x[:, 1:, :]
+        # B, N, C = x.shape
+        # x = x.reshape(B_orig, -1, C)
+        x = rearrange(x, '(b t) n c -> b (t n) c', b=B_orig)
         B, N, C = x.shape
-        x = x.reshape(B_orig, -1, C)
-        B, N, C = x.shape
-
-        # x = rearrange(x, '(b t) n c -> b (t n) c')
         # we don't unshuffle the correct visible token order,
         # but shuffle the pos embedding accorddingly.
         expand_pos_embed = self.pos_embed.expand(B, -1, -1).type_as(x).to(x.device).clone().detach()
@@ -144,7 +145,6 @@ class VideoMAETimm(nn.Module):
         if self.camera_params_enabled:
             pred_cams = x[1]
             x = x[0]
-
         if self.camera_params_enabled:
             if self.categorical_camera:
                 pred_cams = self.camera_decoder(pred_cams)
@@ -160,20 +160,19 @@ class VideoMAETimm(nn.Module):
     def forward(self, x, mask, camera=None):
         return self.forward_masked(x, mask, camera=camera)
 
-def videomae_2d_3d_vit_small_patch16_dec192d4(**kwargs):
+def videomae_vit_small_patch16_dec192d4(**kwargs):
     model = VideoMAETimm(
         patch_size=16, encoder_embed_dim=384, depth=12, num_heads=6,
         decoder_embed_dim=192, decoder_depth=4, decoder_num_heads=3,
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model 
 
-def videomae_3d_3d_vit_small_3dpatch16_dec192d4(**kwargs):
+def autoencoder_vit_small_patch16_dec192d4(**kwargs):
     model = VideoMAETimm(
         patch_size=16, encoder_embed_dim=384, depth=12, num_heads=6,
         decoder_embed_dim=192, decoder_depth=4, decoder_num_heads=3,
-        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), tubelet_size=2,
-        encoder_3d=True, patch_embed_type='3d', **kwargs)
-    return model   
+        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model 
 
 def videomae_3d_3d_vit_small_2dpatch16_dec192d4(**kwargs):
     model = VideoMAETimm(
@@ -190,8 +189,16 @@ def videomae_beit_large_patch16_dec512d8(**kwargs):
         mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model 
 
-videomae_vit_small_patch16 = videomae_2d_3d_vit_small_patch16_dec192d4 # decoder: 192 dim, 4 blocks
-videomae_beit_large_patch16 = videomae_beit_large_patch16_dec512d8
+def videomae_3d_3d_beit_large_patch16_dec512d8(**kwargs):
+    model = VideoMAETimm(encoder_name='beitv2_large_patch16_224.in1k_ft_in22k_in1k',
+        backbone_name='EncoderBeit', patch_size=16, encoder_embed_dim=1024, depth=24, 
+        num_heads=16,decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
+        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), encoder_3d=True, patch_embed_type='2d', **kwargs)
+    return model 
 
-videomae_3d_vit_small_3dpatch16 = videomae_3d_3d_vit_small_3dpatch16_dec192d4 # decoder: 192 dim, 4 blocks
+videomae_vit_small_patch16 = videomae_vit_small_patch16_dec192d4 # decoder: 192 dim, 4 blocks
+videomae_beit_large_patch16 = videomae_beit_large_patch16_dec512d8
+autoencoder_vit_small_patch16 = autoencoder_vit_small_patch16_dec192d4
+
 videomae_3d_vit_small_2dpatch16 = videomae_3d_3d_vit_small_2dpatch16_dec192d4 # decoder: 192 dim, 4 blocks
+videomae_3d_beit_large_2dpatch16 = videomae_3d_3d_beit_large_patch16_dec512d8

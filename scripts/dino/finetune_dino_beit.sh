@@ -1,5 +1,5 @@
 module load libjpeg-turbo
-OUTPUT_DIR='outs/autoreg_dino_beit_large_patch16_pretrained_3d_0218'
+OUTPUT_DIR='outs/autoreg_dino_beit_large_patch16_pretrained_3d_lr001_0220'
 export HUGGINGFACE_HUB_CACHE=./pretrained_ckpts
 
 DATA_PATH='data_lists/co3d_train.txt'
@@ -21,10 +21,10 @@ NCCL_DEBUG=INFO OMP_NUM_THREADS=1  python3 -m torch.distributed.run \
         --mask_ratio 0.75 \
         --model autoreg_dino_beit_large_patch16 \
         --batch_size 8 \
-        --lr 0.0001 \
+        --lr 0.001 \
         --no-binocular \
         --num_frames 8 \
-        --weight_decay 0.01 \
+        --weight_decay 0.0001 \
         --sampling_rate 4 \
         --opt adamw \
         --opt_betas 0.9 0.95 \

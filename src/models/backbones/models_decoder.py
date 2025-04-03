@@ -7,9 +7,17 @@ from functools import partial
 from timm.models.vision_transformer import PatchEmbed
 from timm.models.registry import register_model
 from timm.models.layers import trunc_normal_ as __call_trunc_normal_
-from src.models.models_vit import Block
+from src.models.backbones.models_vit import Block
 from einops.layers.torch import Rearrange, Reduce
 
+class DecoderWrapper(nn.Module):
+    def __init__(self, encoder_to_decoder, decoder):
+        super().__init__()
+        self.encoder_to_decoder = encoder_to_decoder
+        self.decoder = decoder
+
+    def forward(self, x, return_token_num, attn_mask=None):
+        return self.decoder(self.encoder_to_decoder(x), return_token_num=return_token_num, attn_mask=attn_mask)
 class DecoderViT(nn.Module):
     def __init__(self, num_classes=768, embed_dim=768,
                  depth=12, num_heads=12, mlp_ratio=4., 
@@ -42,3 +50,4 @@ class DecoderViT(nn.Module):
         if self.camera_params_enabled:
             return x, pc
         return x
+    
